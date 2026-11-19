@@ -510,6 +510,7 @@ function CNLPModel(
     args...;
     prefix::AbstractString = "rec",
     name::AbstractString = basename(lib.path),
+    device::Symbol = :cpu,
 )
     sym(s) = Symbol(prefix, "_", s)
     fp(s) = Libdl.dlsym(lib.handle, sym(s))
@@ -556,8 +557,20 @@ function CNLPModel(
     # an OPF library printing `no BLAS/LAPACK library loaded for dcopy_()`
     # at solve time until an explicit restore.
     restore_blas!(lib)
-    return m
+    device === :cpu && return m
+    # The device tier (`P_device`, `P_*_d`): a model on the same instance whose
+    # metadata and buffers live on the device. Provided by a package extension.
+    hasmethod(_device_model, Tuple{Val{device}, CNLPModel}) || throw(ArgumentError(
+        "`device = :$device` needs its extension loaded (for :cuda, `using CUDA` or `using CUDACore`)"))
+    return _device_model(Val(device), m)
 end
+
+"""
+    _device_model(::Val{device}, m::CNLPModel)
+
+The device-resident model for host model `m`. Methods live in package extensions.
+"""
+function _device_model end
 
 """
     CNLPModel(spec::AbstractString, arg1, arg2, ...; kwargs...)
@@ -611,10 +624,10 @@ Omitting the symbol keeps the single-model spelling, where the prefix falls back
 to the library name — so a one-model library is unaffected.
 """
 function CNLPModel(
-    lib::CLib, model::Symbol, args...; name::AbstractString = String(model),
+    lib::CLib, model::Symbol, args...; name::AbstractString = String(model), kwargs...,
 )
     _require_model(lib, model)
-    return CNLPModel(lib, args...; prefix = String(model), name = name)
+    return CNLPModel(lib, args...; prefix = String(model), name = name, kwargs...)
 end
 
 # A name this library does not carry must be reported HERE. `_nvar` is the

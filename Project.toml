@@ -13,7 +13,14 @@ Patchelf_jll = "f2cf89d6-2bfd-5c44-bd2c-068eea195c0c"
 Random = "9a3f8284-a2c9-5f02-9a11-845980a1fd5c"
 StructIO = "53d494c1-5632-5724-8f4c-31dff12d585f"
 
+[weakdeps]
+CUDACore = "bd0ed864-bdfe-4181-a5ed-ce625a5fdea2"
+
+[extensions]
+CNLPModelsCUDAExt = "CUDACore"
+
 [compat]
+CUDACore = "6"
 NLPModels = "0.21"
 ObjectFile = "0.5"
 Patchelf_jll = "0.18"
