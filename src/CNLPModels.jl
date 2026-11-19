@@ -532,10 +532,15 @@ function CNLPModel(
         id, x0, lvar, uvar, lcon, ucon)
     _check(st, sym(:meta))
 
+    # The objective sense is optional in the ABI: a library without P_minimize
+    # minimizes.
+    mp = Libdl.dlsym(lib.handle, sym(:minimize); throw_error = false)
+    minimize = mp === nothing ? true : ccall(mp, Cint, (Cint,), id) != 0
+
     meta = NLPModelMeta(
         nvar; ncon = ncon, nnzj = nnzj, nnzh = nnzh,
         x0 = x0, lvar = lvar, uvar = uvar, lcon = lcon, ucon = ucon,
-        minimize = true, name = String(name),
+        minimize = minimize, name = String(name),
     )
     vars, cons, pars = _read_layout(lib, prefix, id)
     m = CNLPModel(
