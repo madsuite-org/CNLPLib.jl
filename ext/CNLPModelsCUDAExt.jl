@@ -200,4 +200,15 @@ NLPModels.hprod!(m::CuCNLPModel, x::StridedCuVector{Float64}, v::StridedCuVector
                  Hv::StridedCuVector{Float64}; obj_weight::Real = 1.0) =
     NLPModels.hprod!(m, x, m.zeroy, v, Hv; obj_weight)
 
+# Named blocks and parameters are host-side instance state: answer from the host model.
+CNLPModels.get_vars(m::CuCNLPModel, args...) = CNLPModels.get_vars(m.host, args...)
+CNLPModels.get_cons(m::CuCNLPModel, args...) = CNLPModels.get_cons(m.host, args...)
+CNLPModels.get_pars(m::CuCNLPModel, args...) = CNLPModels.get_pars(m.host, args...)
+CNLPModels.get_value(m::CuCNLPModel, b) = CNLPModels.get_value(m.host, b)
+CNLPModels.set_value!(m::CuCNLPModel, b, v) = (CNLPModels.set_value!(m.host, b, v); m)
+
+# Writers run on the host, against the host model of the same instance.
+CNLPModels.writers(m::CuCNLPModel) = CNLPModels.writers(m.host)
+CNLPModels.write_solution(m::CuCNLPModel, args...; kwargs...) = CNLPModels.write_solution(m.host, args...; kwargs...)
+
 end # module

@@ -70,7 +70,7 @@ import NLPModels: NLPModels, AbstractNLPModel, NLPModelMeta, Counters,
 
 export CNLPModel, argtype, available_models, restore_blas!, schema_json, set_path!, @cnlp_str,
     get_vars, get_cons, get_pars, get_value, set_value!,
-    solution, multipliers, multipliers_L, multipliers_U
+    solution, multipliers, multipliers_L, multipliers_U, writers, write_solution
 
 include("patchversion.jl")
 include("private_runtime.jl")
@@ -1052,5 +1052,55 @@ function NLPModels.hprod!(
 )
     return NLPModels.hprod!(m, x, zeros(m.meta.ncon), v, Hv; obj_weight = obj_weight)
 end
+
+# ── solution writers ─────────────────────────────────────────────────────────────
+# A library may carry writers for its models (P_nwriters, P_writer_name,
+# P_write_<name>): code that turns a solution into the model's own file format,
+# such as a solved MATPOWER case. They run on the host.
+
+"""
+    writers(m) -> Vector{Symbol}
+
+The solution writers the library carries for this model; empty if none.
+"""
+function writers(m::CNLPModel)
+    np = Libdl.dlsym(m.lib.handle, Symbol(m.prefix, "_nwriters"); throw_error = false)
+    np === nothing && return Symbol[]
+    fp = Libdl.dlsym(m.lib.handle, Symbol(m.prefix, "_writer_name"))
+    out = Symbol[]
+    for k in 0:(Int(ccall(np, Cint, ())) - 1)
+        n = ccall(fp, Cint, (Cint, Ptr{UInt8}, Cint), k, C_NULL, 0)
+        buf = Vector{UInt8}(undef, n)
+        ccall(fp, Cint, (Cint, Ptr{UInt8}, Cint), k, buf, n)
+        push!(out, Symbol(String(buf)))
+    end
+    return out
+end
+
+"""
+    write_solution(m, writer, path, result)
+    write_solution(m, writer, path, x, y, zl, zu; objective, status = "")
+
+Write a solution with one of the library's writers (see [`writers`](@ref)).
+`result` is a solver result with `solution`, `multipliers`, `multipliers_L`,
+`multipliers_U`, `objective` and `status` (MadNLP's, NLPModelsIpopt's); arrays
+on a device are copied to the host first.
+"""
+function write_solution(m::CNLPModel, writer::Symbol, path::AbstractString,
+                        x::AbstractVector, y::AbstractVector, zl::AbstractVector, zu::AbstractVector;
+                        objective::Real, status::AbstractString = "")
+    writer in writers(m) || throw(ArgumentError("`$(m.prefix)` has no writer `$writer`; it has $(writers(m))"))
+    @lencheck m.meta.nvar x zl zu
+    @lencheck m.meta.ncon y
+    fp = Libdl.dlsym(m.lib.handle, Symbol(m.prefix, "_write_", writer))
+    hx, hy, hl, hu = (Vector{Float64}(Array(v)) for v in (x, y, zl, zu))
+    _check(ccall(fp, Cint, (Cint, Cstring, Ptr{Cdouble}, Ptr{Cdouble}, Ptr{Cdouble}, Ptr{Cdouble}, Cdouble, Cstring),
+                 m.id, path, hx, hy, hl, hu, Cdouble(objective), status), Symbol(m.prefix, "_write_", writer))
+    return path
+end
+
+write_solution(m::CNLPModel, writer::Symbol, path::AbstractString, result) =
+    write_solution(m, writer, path, result.solution, result.multipliers, result.multipliers_L, result.multipliers_U;
+                   objective = result.objective, status = string(result.status))
 
 end # module CNLPModels
