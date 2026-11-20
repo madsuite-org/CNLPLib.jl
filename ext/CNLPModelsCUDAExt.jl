@@ -211,4 +211,6 @@ CNLPModels.set_value!(m::CuCNLPModel, b, v) = (CNLPModels.set_value!(m.host, b, 
 CNLPModels.writers(m::CuCNLPModel) = CNLPModels.writers(m.host)
 CNLPModels.write_solution(m::CuCNLPModel, args...; kwargs...) = CNLPModels.write_solution(m.host, args...; kwargs...)
 
+CNLPModels.default_writer(m::CuCNLPModel) = CNLPModels.default_writer(m.host)
+
 end # module

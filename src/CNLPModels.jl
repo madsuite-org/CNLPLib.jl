@@ -70,7 +70,7 @@ import NLPModels: NLPModels, AbstractNLPModel, NLPModelMeta, Counters,
 
 export CNLPModel, argtype, available_models, restore_blas!, schema_json, set_path!, @cnlp_str,
     get_vars, get_cons, get_pars, get_value, set_value!,
-    solution, multipliers, multipliers_L, multipliers_U, writers, write_solution
+    solution, multipliers, multipliers_L, multipliers_U, writers, write_solution, default_writer
 
 include("patchversion.jl")
 include("private_runtime.jl")
@@ -1102,5 +1102,108 @@ end
 write_solution(m::CNLPModel, writer::Symbol, path::AbstractString, result) =
     write_solution(m, writer, path, result.solution, result.multipliers, result.multipliers_L, result.multipliers_U;
                    objective = result.objective, status = string(result.status))
+
+# ── the standard solution format ────────────────────────────────────────────────
+# Any library gets it, built from its named blocks; a library can name its own
+# default writer instead (P_default_writer, e.g. a MATPOWER case for OPF models).
+#
+# HDF5 (`.h5`, with `using HDF5`): the `/solution` group ExaModelsIO writes
+# (solution, multipliers, multipliers_L, multipliers_U, objective, status), so
+# `ExaModelsIO.read_solution` reads it, plus `/blocks/{variables,constraints,
+# parameters}/<name>/...` with each named block in its shape (Julia, column-major
+# dims). JSON (`.json`): the same content, every array flat with its `dims`.
+
+# The solution as plain host data, organized by the library's named blocks.
+function _solution_record(m::CNLPModel, result)
+    x = Vector{Float64}(Array(result.solution))
+    y = Vector{Float64}(Array(result.multipliers))
+    zl = Vector{Float64}(Array(result.multipliers_L))
+    zu = Vector{Float64}(Array(result.multipliers_U))
+    c = m.meta.ncon > 0 ? NLPModels.cons(m, x) : Float64[]
+    sl(v, b) = reshape(v[(b.offset + 1):(b.offset + b.length)], b.dims...)
+    blocks = Tuple{String,String,Vector{Pair{String,Array{Float64}}}}[]
+    for (name, b) in pairs(get_vars(m))
+        push!(blocks, ("variables", String(name), ["value" => sl(x, b),
+            "bound_multiplier_lower" => sl(zl, b), "bound_multiplier_upper" => sl(zu, b)]))
+    end
+    for (name, b) in pairs(get_cons(m))
+        push!(blocks, ("constraints", String(name), ["value" => sl(c, b), "multiplier" => sl(y, b)]))
+    end
+    for (name, b) in pairs(get_pars(m))
+        push!(blocks, ("parameters", String(name), ["value" => reshape(Vector{Float64}(get_value(m, b)), b.dims...)]))
+    end
+    return (; library = basename(m.lib.path), model = m.prefix, minimize = m.meta.minimize,
+            objective = Float64(result.objective), status = string(result.status),
+            iterations = hasproperty(result, :iter) ? Int(result.iter) : -1,
+            x, y, zl, zu, blocks)
+end
+
+_json(io, v::Real) = isfinite(v) ? print(io, Float64(v)) : print(io, "null")
+_json(io, s::AbstractString) = (print(io, '"'); print(io, escape_string(s)); print(io, '"'))
+function _json(io, a::AbstractArray{<:Real})
+    print(io, '[')
+    for (i, v) in enumerate(a)
+        i > 1 && print(io, ',')
+        _json(io, v)
+    end
+    print(io, ']')
+end
+
+function _write_standard(::Val{:json}, path::AbstractString, r)
+    open(path, "w") do io
+        print(io, "{\"format\":\"cnlp-solution\",\"format_version\":\"1.0\",\"library\":"); _json(io, r.library)
+        print(io, ",\"model\":"); _json(io, r.model)
+        print(io, ",\"minimize\":", r.minimize, ",\"objective\":"); _json(io, r.objective)
+        print(io, ",\"status\":"); _json(io, r.status); print(io, ",\"iterations\":", r.iterations)
+        for (k, v) in (("solution", r.x), ("multipliers", r.y), ("multipliers_L", r.zl), ("multipliers_U", r.zu))
+            print(io, ",\"", k, "\":"); _json(io, v)
+        end
+        for kind in ("variables", "constraints", "parameters")
+            print(io, ",\"", kind, "\":{")
+            first = true
+            for (k, name, fields) in r.blocks
+                k == kind || continue
+                first || print(io, ','); first = false
+                _json(io, name); print(io, ":{\"dims\":["); join(io, size(last(fields[1])), ','); print(io, ']')
+                for (f, a) in fields
+                    print(io, ",\"", f, "\":"); _json(io, a)
+                end
+                print(io, '}')
+            end
+            print(io, '}')
+        end
+        print(io, "}\n")
+    end
+    return path
+end
+
+# `_write_standard(::Val{:h5}, ...)` is defined by the HDF5 extension (`using HDF5`).
+
+# The writer the library names as its default for this model, or `nothing`.
+function default_writer(m::CNLPModel)
+    fp = Libdl.dlsym(m.lib.handle, Symbol(m.prefix, "_default_writer"); throw_error = false)
+    fp === nothing && return nothing
+    n = ccall(fp, Cint, (Cint, Ptr{UInt8}, Cint), m.id, C_NULL, 0)
+    n <= 0 && return nothing
+    buf = Vector{UInt8}(undef, n)
+    ccall(fp, Cint, (Cint, Ptr{UInt8}, Cint), m.id, buf, n)
+    return Symbol(String(buf))
+end
+
+"""
+    write_solution(m, path, result; format = nothing)
+
+Write a solution in the model's default format: the library's own default writer
+if it names one (e.g. a MATPOWER case), otherwise the standard format, chosen by
+the extension of `path` (`.json` for JSON, anything else HDF5). `format` forces
+`:h5`, `:json`, or one of [`writers`](@ref).
+"""
+function write_solution(m::CNLPModel, path::AbstractString, result; format::Union{Nothing,Symbol} = nothing)
+    f = format !== nothing ? format : something(default_writer(m), endswith(path, ".json") ? :json : :h5)
+    f === :h5 && !hasmethod(_write_standard, Tuple{Val{:h5}, AbstractString, Any}) &&
+        throw(ArgumentError("writing `.h5` needs HDF5: `using HDF5` (or write `.json`)"))
+    f in (:h5, :json) && return _write_standard(Val(f), path, _solution_record(m, result))
+    return write_solution(m, f, path, result)
+end
 
 end # module CNLPModels

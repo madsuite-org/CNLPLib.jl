@@ -14,12 +14,15 @@ Random = "9a3f8284-a2c9-5f02-9a11-845980a1fd5c"
 StructIO = "53d494c1-5632-5724-8f4c-31dff12d585f"
 
 [weakdeps]
+HDF5 = "f67ccb44-e63f-5c2f-98bd-6dc0ccc4ba2f"
 CUDACore = "bd0ed864-bdfe-4181-a5ed-ce625a5fdea2"
 
 [extensions]
+CNLPModelsHDF5Ext = "HDF5"
 CNLPModelsCUDAExt = "CUDACore"
 
 [compat]
+HDF5 = "0.17"
 CUDACore = "6"
 NLPModels = "0.21"
 ObjectFile = "0.5"
