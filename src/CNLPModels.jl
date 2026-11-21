@@ -70,7 +70,8 @@ import NLPModels: NLPModels, AbstractNLPModel, NLPModelMeta, Counters,
 
 export CNLPModel, argtype, available_models, restore_blas!, schema_json, set_path!, @cnlp_str,
     get_vars, get_cons, get_pars, get_value, set_value!,
-    solution, multipliers, multipliers_L, multipliers_U, writers, write_solution, default_writer
+    solution, multipliers, multipliers_L, multipliers_U, writers, write_solution, default_writer,
+    readers, default_reader, read_start, read_parameters!
 
 include("patchversion.jl")
 include("private_runtime.jl")
@@ -511,11 +512,19 @@ function CNLPModel(
     prefix::AbstractString = "rec",
     name::AbstractString = basename(lib.path),
     device::Symbol = :cpu,
+    input::Union{Nothing, Pair} = nothing,
 )
     sym(s) = Symbol(prefix, "_", s)
     fp(s) = Libdl.dlsym(lib.handle, sym(s))
 
-    id = _instantiate(lib, prefix, args)
+    # `input = :name => path`: instantiate through one of the model's own
+    # instance readers (the readers tier) instead of its entry point.
+    id = if input === nothing
+        _instantiate(lib, prefix, args)
+    else
+        isempty(args) || throw(ArgumentError("give either instantiation arguments or `input`, not both"))
+        _instantiate_reader(lib, prefix, Symbol(first(input)), String(last(input)))
+    end
     # The library's runtime is fully initialized by now: repair whatever its
     # lazy initialization did to the shared trampoline.
     restore_blas!(lib)
@@ -1204,6 +1213,102 @@ function write_solution(m::CNLPModel, path::AbstractString, result; format::Unio
         throw(ArgumentError("writing `.h5` needs HDF5: `using HDF5` (or write `.json`)"))
     f in (:h5, :json) && return _write_standard(Val(f), path, _solution_record(m, result))
     return write_solution(m, f, path, result)
+end
+
+# ── readers: the model's own input formats ──────────────────────────────────────
+# (cnlp.h, the readers tier). Kinds: :instance, :parameters, :start.
+
+const _READER_KINDS = (:instance, :parameters, :start)
+
+# The ABI string convention (call once to size, once to fill), for the two
+# shapes readers use: (buf, cap) and (k, buf, cap).
+function _copyout(fp)
+    n = ccall(fp, Cint, (Ptr{UInt8}, Cint), C_NULL, 0)
+    n <= 0 && return ""
+    buf = Vector{UInt8}(undef, n)
+    ccall(fp, Cint, (Ptr{UInt8}, Cint), buf, n)
+    return String(buf)
+end
+function _copyout(fp, k::Cint)
+    n = ccall(fp, Cint, (Cint, Ptr{UInt8}, Cint), k, C_NULL, 0)
+    n <= 0 && return ""
+    buf = Vector{UInt8}(undef, n)
+    ccall(fp, Cint, (Cint, Ptr{UInt8}, Cint), k, buf, n)
+    return String(buf)
+end
+
+"""
+    readers(lib, model::Symbol) -> Vector{Pair{Symbol,Symbol}}
+    readers(m) -> Vector{Pair{Symbol,Symbol}}
+
+The model's own input readers, as `name => kind` with kind `:instance`,
+`:parameters` or `:start`; empty if the library carries none.
+"""
+function readers(lib::CLib, model::Symbol)
+    np = Libdl.dlsym(lib.handle, Symbol(model, "_nreaders"); throw_error = false)
+    np === nothing && return Pair{Symbol,Symbol}[]
+    fn = Libdl.dlsym(lib.handle, Symbol(model, "_reader_name"))
+    fk = Libdl.dlsym(lib.handle, Symbol(model, "_reader_kind"))
+    return [Symbol(_copyout(fn, Cint(k))) => _READER_KINDS[ccall(fk, Cint, (Cint,), k) + 1]
+            for k in 0:(Int(ccall(np, Cint, ())) - 1)]
+end
+readers(m::CNLPModel) = readers(m.lib, Symbol(m.prefix))
+
+"""
+    default_reader(lib, model::Symbol) -> Union{Symbol,Nothing}
+
+The instance reader the model uses for a bare path, if it names one.
+"""
+function default_reader(lib::CLib, model::Symbol)
+    fp = Libdl.dlsym(lib.handle, Symbol(model, "_default_reader"); throw_error = false)
+    fp === nothing && return nothing
+    name = _copyout(fp)
+    return isempty(name) ? nothing : Symbol(name)
+end
+
+function _reader_of_kind(lib, prefix, name::Symbol, kind::Symbol)
+    rs = readers(lib, Symbol(prefix))
+    any(==(name => kind), rs) || throw(ArgumentError(
+        "`$prefix` has no $kind reader `$name`; its readers are $(isempty(rs) ? "none" : rs)"))
+    return nothing
+end
+
+function _instantiate_reader(lib::CLib, prefix::AbstractString, name::Symbol, path::String)
+    _reader_of_kind(lib, prefix, name, :instance)
+    fp = Libdl.dlsym(lib.handle, Symbol(prefix, "_new_from_", name))
+    id = ccall(fp, Cint, (Cstring,), path)
+    id > 0 || error("`$(prefix)_new_from_$(name)` could not create an instance from $path")
+    return id
+end
+
+"""
+    read_start(m, reader::Symbol, path) -> (; x0, y0, zl, zu)
+
+A starting point read from the model's own file format by one of its start
+readers, as host vectors. Use it to warm-start a solve, e.g.
+`madnlp(m; x0 = s.x0)` or by copying into `m.meta.x0`.
+"""
+function read_start(m::CNLPModel, reader::Symbol, path::AbstractString)
+    _reader_of_kind(m.lib, m.prefix, reader, :start)
+    n, k = m.meta.nvar, m.meta.ncon
+    x0, y0, zl, zu = zeros(n), zeros(k), zeros(n), zeros(n)
+    fp = Libdl.dlsym(m.lib.handle, Symbol(m.prefix, "_start_from_", reader))
+    _check(ccall(fp, Cint, (Cint, Cstring, Ptr{Cdouble}, Ptr{Cdouble}, Ptr{Cdouble}, Ptr{Cdouble}),
+                 m.id, path, x0, y0, zl, zu), Symbol(m.prefix, "_start_from_", reader))
+    return (; x0, y0, zl, zu)
+end
+
+"""
+    read_parameters!(m, reader::Symbol, path) -> m
+
+Set the model's parameters from its own file format, with one of its parameter
+readers. Live, like [`set_value!`](@ref).
+"""
+function read_parameters!(m::CNLPModel, reader::Symbol, path::AbstractString)
+    _reader_of_kind(m.lib, m.prefix, reader, :parameters)
+    fp = Libdl.dlsym(m.lib.handle, Symbol(m.prefix, "_set_from_", reader))
+    _check(ccall(fp, Cint, (Cint, Cstring), m.id, path), Symbol(m.prefix, "_set_from_", reader))
+    return m
 end
 
 end # module CNLPModels

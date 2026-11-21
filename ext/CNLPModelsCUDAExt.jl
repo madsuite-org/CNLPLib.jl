@@ -213,4 +213,8 @@ CNLPModels.write_solution(m::CuCNLPModel, args...; kwargs...) = CNLPModels.write
 
 CNLPModels.default_writer(m::CuCNLPModel) = CNLPModels.default_writer(m.host)
 
+CNLPModels.readers(m::CuCNLPModel) = CNLPModels.readers(m.host)
+CNLPModels.read_start(m::CuCNLPModel, args...) = CNLPModels.read_start(m.host, args...)
+CNLPModels.read_parameters!(m::CuCNLPModel, args...) = (CNLPModels.read_parameters!(m.host, args...); m)
+
 end # module
