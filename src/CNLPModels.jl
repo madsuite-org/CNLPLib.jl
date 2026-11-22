@@ -1284,6 +1284,29 @@ end
 # What a first use compiles (a traced load, construction and callbacks of a host model),
 # compiled here so it is in the package image. A statement naming something a dependency
 # no longer has is skipped.
+# The model API on the host storage type, compiled into the package image so the first
+# model of a session runs without compiling.
+let M = CNLPModel{Vector{Float64}, Vector{Int}}, V = Vector{Float64}, W = NamedTuple{(:obj_weight,), Tuple{Float64}}
+    precompile(CNLPModel, (CLib, Symbol, Int))
+    precompile(CNLPModel, (CLib, Int))
+    precompile(Core.kwcall, (NamedTuple{(:prefix,), Tuple{String}}, Type{CNLPModel}, CLib, Int))
+    for (f, args) in (
+        (NLPModels.obj, (M, V)), (NLPModels.grad, (M, V)), (NLPModels.grad!, (M, V, V)),
+        (NLPModels.cons, (M, V)), (NLPModels.cons!, (M, V, V)), (NLPModels.cons_nln!, (M, V, V)),
+        (NLPModels.jac_structure, (M,)), (NLPModels.hess_structure, (M,)),
+        (NLPModels.jac_coord, (M, V)), (NLPModels.jac_coord!, (M, V, V)),
+        (NLPModels.hess_coord, (M, V)), (NLPModels.hess_coord, (M, V, V)),
+        (NLPModels.hess_coord!, (M, V, V)), (NLPModels.hess_coord!, (M, V, V, V)),
+        (NLPModels.jprod, (M, V, V)), (NLPModels.jprod!, (M, V, V, V)),
+        (NLPModels.jtprod, (M, V, V)), (NLPModels.jtprod!, (M, V, V, V)),
+        (NLPModels.hprod, (M, V, V)), (NLPModels.hprod, (M, V, V, V)),
+        (NLPModels.hprod!, (M, V, V, V)), (NLPModels.hprod!, (M, V, V, V, V)),
+    )
+        precompile(f, args)
+        precompile(Core.kwcall, (W, typeof(f), args...))
+    end
+end
+
 module PrecompileStatements
     for (id, m) in Base.loaded_modules
         name = Symbol(id.name)
