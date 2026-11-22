@@ -1,5 +1,5 @@
 using Test
-using CNLPModels
+using CNLPModels, HDF5
 using NLPModels
 using LinearAlgebra
 using MadNLP
@@ -16,6 +16,13 @@ run(`$cc -shared -fPIC -O2 -o $LIBPATH $(joinpath(FIXDIR, "tinyqp.c"))`)
 
     @testset "init failure surfaces" begin
         @test_throws ErrorException CNLPModel(lib, 1; prefix = "tq")
+    end
+
+    @testset "storage type" begin
+        m = CNLPModel(lib, 4; prefix = "tq")
+        @test m isa CNLPModel{Vector{Float64}} && m isa AbstractNLPModel{Float64, Vector{Float64}}
+        # a device model needs its extension (and a library with the device tier)
+        @test_throws ArgumentError CNLPModel(lib, 4; prefix = "tq", device = :cuda)
     end
 
     m = CNLPModel(lib, 4; prefix = "tq")
@@ -460,4 +467,25 @@ end
     # (The fixture has no conformant-but-lying library to probe the warn
     # path hermetically; the empty-tier path is what is testable here.)
     @test keys(get_vars(CNLPModel(lib, 4; prefix = "tq"))) == (:x,)
+end
+
+@testset "standard solution format (cnlp-solution 0.2)" begin
+    m = CNLPModel(CNLPModels.load(LIBPATH), :tq, 4)
+    res = madnlp(m; print_level = MadNLP.ERROR)
+    path = joinpath(mktempdir(), "sol.h5")
+    @test write_solution(m, path, res) == path            # no default writer: the standard format
+    HDF5.h5open(path) do f
+        a = HDF5.attributes(f)
+        @test read(a["format"]) == "cnlp-solution" && read(a["format_version"]) == "0.2"
+        @test read(a["nvar"]) == m.meta.nvar && read(a["ncon"]) == m.meta.ncon
+        s = f["solution"]
+        x, y = read(s["solution"]), read(s["multipliers"])
+        zl, zu = read(s["multipliers_L"]), read(s["multipliers_U"])
+        @test read(s["status"]) == "solved" && read(s["minimize"]) == 1
+        @test read(s["objective"]) ≈ obj(m, x)
+        σ = m.meta.minimize ? 1.0 : -1.0
+        @test maximum(abs, σ .* grad(m, x) .+ jtprod(m, x, y) .- zl .+ zu) < 1e-6
+        @test minimum(zl) >= 0 && minimum(zu) >= 0
+        @test haskey(f, "blocks/variables/x")             # tq names its variable x
+    end
 end

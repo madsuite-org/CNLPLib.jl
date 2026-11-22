@@ -7,35 +7,14 @@ Ipopt, ...) can solve it. The main producer of such libraries is ExaModels'
 tape recorder (`compile_library`), but any
 library implementing the ABI below works, in any language.
 
-Implements cnlp ABI v0.1 (normative spec: `cnlp.h` at
-https://github.com/madsuite-org/cnlp-abi, tag v0.1).
+Implements cnlp ABI 0.2 (normative spec: `cnlp.h` at
+https://github.com/madsuite-org/cnlp-abi).
 
-# C ABI convention
-
-For a chosen symbol `prefix` (e.g. `rec`), the library exposes — all indices
-1-based, Hessian as the lower triangle of `obj_weight * ∇²f + Σ yᵢ ∇²cᵢ`,
-every function returning `Cint` status `0` on success:
-
-    <prefix>_new(n::Cint)::Cint                   # instantiate at size n; returns
-                                                  # a positive model id, 0 on failure
-    <prefix>_nvar(id::Cint)::Cint
-    <prefix>_ncon(id::Cint)::Cint
-    <prefix>_nnzj(id::Cint)::Cint
-    <prefix>_nnzh(id::Cint)::Cint
-    <prefix>_meta(id, x0, lvar, uvar, lcon, ucon)::Cint      # Ptr{Cdouble} × 5
-    <prefix>_obj(id, x::Ptr{Cdouble}, out::Ptr{Cdouble})::Cint
-    <prefix>_grad(id, x::Ptr{Cdouble}, g::Ptr{Cdouble})::Cint
-    <prefix>_cons(id, x::Ptr{Cdouble}, c::Ptr{Cdouble})::Cint
-    <prefix>_jac_structure(id, rows::Ptr{Cint}, cols::Ptr{Cint})::Cint
-    <prefix>_jac(id, x::Ptr{Cdouble}, vals::Ptr{Cdouble})::Cint
-    <prefix>_hess_structure(id, rows::Ptr{Cint}, cols::Ptr{Cint})::Cint
-    <prefix>_hess(id, x::Ptr{Cdouble}, y::Ptr{Cdouble}, obj_weight::Cdouble,
-                  vals::Ptr{Cdouble})::Cint
-
-Handles make models independent: any number of `CNLPModel`s may coexist per
-library (each `<prefix>_new` call creates one; models live for the process
-lifetime). A library may also carry *several models*, one prefix each — name
-the one you want as a symbol, `CNLPModel("@grid", :acopf, ...)`.
+A model is a `CNLPModel{VT}`: `VT = Vector{Float64}` evaluates through the library's
+host callbacks; with `device = :cuda` (CUDA extension) `VT` is a `CuVector` and the
+same instance evaluates through the device tier (`P_*_d`) on device pointers. Any
+number of instances may coexist per library, and a library may carry several models,
+one prefix each: `CNLPModel("@grid", :acopf, ...)`.
 
 # The libblastrampoline seam
 
@@ -70,7 +49,8 @@ import NLPModels: NLPModels, AbstractNLPModel, NLPModelMeta, Counters,
 
 export CNLPModel, argtype, available_models, restore_blas!, schema_json, set_path!, @cnlp_str,
     get_vars, get_cons, get_pars, get_value, set_value!,
-    solution, multipliers, multipliers_L, multipliers_U
+    solution, multipliers, multipliers_L, multipliers_U, writers, write_solution, default_writer,
+    readers, default_reader, read_start, read_parameters!
 
 include("patchversion.jl")
 include("private_runtime.jl")
@@ -187,29 +167,41 @@ function restore_blas!(lib::CLib)
     return lib
 end
 
-struct CNLPModel <: AbstractNLPModel{Float64, Vector{Float64}}
-    meta::NLPModelMeta{Float64, Vector{Float64}}
+"""
+    CNLPModel{VT}
+
+A model instance of a cnlp library as an `AbstractNLPModel{Float64, VT}`. `VT` is where
+the solver's vectors live: `Vector{Float64}` on the host, a GPU vector type for a model
+built with `device = ...` (the evaluation pointers are then the library's device tier).
+Structure, layout, parameters, readers and writers are instance state and work the same
+for every `VT`.
+"""
+struct CNLPModel{VT <: AbstractVector{Float64}, IT <: AbstractVector{Int}} <: AbstractNLPModel{Float64, VT}
+    meta::NLPModelMeta{Float64, VT}
     counters::Counters
     lib::CLib
-    id::Cint
+    id::Int64
+    # evaluation: the host callbacks, or the device tier (`P_*_d`)
     obj_p::Ptr{Cvoid}
     grad_p::Ptr{Cvoid}
     cons_p::Ptr{Cvoid}
-    jac_structure_p::Ptr{Cvoid}
     jac_p::Ptr{Cvoid}
-    hess_structure_p::Ptr{Cvoid}
     hess_p::Ptr{Cvoid}
-    # cached Jacobian structure + a value buffer, for jprod!/jtprod!
+    # the sparsity structures, read once on the host
     jrows::Vector{Int}
     jcols::Vector{Int}
-    jbuf::Vector{Float64}
-    # cached Hessian structure + a value buffer, for hprod!
     hrows::Vector{Int}
     hcols::Vector{Int}
-    hbuf::Vector{Float64}
-    # the model's NAMED blocks, read from the library at construction, and the
-    # prefix they are addressed under (parameters are read and written through
-    # it after the fact)
+    # the same structures where VT lives, value buffers for the products, and the
+    # zero multipliers of the objective-only Hessian
+    vjrows::IT
+    vjcols::IT
+    vhrows::IT
+    vhcols::IT
+    jbuf::VT
+    hbuf::VT
+    zeroy::VT
+    # the model's named blocks and the prefix they are addressed under
     prefix::String
     vars::NamedTuple
     cons::NamedTuple
@@ -233,7 +225,7 @@ struct BlockRef
     offset::Int
     length::Int
     dims::Dims
-    index::Cint
+    index::Int64
 end
 
 Base.length(b::BlockRef) = b.length
@@ -247,7 +239,7 @@ Base.show(io::IO, b::BlockRef) = print(
 # Named blocks are an optional part of the ABI, like the schema and builder:
 # a hand-written C library that implements only the evaluators has nothing to
 # name, and is consumed exactly as before.
-function _read_layout(lib::CLib, prefix::AbstractString, id::Cint)
+function _read_layout(lib::CLib, prefix::AbstractString, id::Int64)
     nb = Libdl.dlsym(lib.handle, Symbol(prefix, "_nblocks"); throw_error = false)
     nb === nothing && return ((;), (;), (;))
     try
@@ -266,26 +258,26 @@ function _read_layout(lib::CLib, prefix::AbstractString, id::Cint)
     end
 end
 
-function _read_layout_strict(lib::CLib, prefix::AbstractString, id::Cint, nb::Ptr{Cvoid})
-    n = ccall(nb, Cint, (Cint,), id)
+function _read_layout_strict(lib::CLib, prefix::AbstractString, id::Int64, nb::Ptr{Cvoid})
+    n = ccall(nb, Int64, (Int64,), id)
     n < 0 && return ((;), (;), (;))
     bp = Libdl.dlsym(lib.handle, Symbol(prefix, "_block"))
     np = Libdl.dlsym(lib.handle, Symbol(prefix, "_block_name"))
     vars, cons, pars = Pair{Symbol,BlockRef}[], Pair{Symbol,BlockRef}[], Pair{Symbol,BlockRef}[]
     for k in 0:(Int(n) - 1)
-        out = zeros(Cint, 4 + 8)
-        _check(ccall(bp, Cint, (Cint, Cint, Ptr{Cint}), id, Cint(k), out),
+        out = zeros(Int64, 4 + 8)
+        _check(ccall(bp, Int64, (Int64, Int64, Ptr{Int64}), id, Int64(k), out),
                Symbol(prefix, "_block"))
-        need = ccall(np, Cint, (Cint, Cint, Ptr{UInt8}, Cint), id, Cint(k), C_NULL, Cint(0))
+        need = ccall(np, Int64, (Int64, Int64, Ptr{UInt8}, Int64), id, Int64(k), C_NULL, Int64(0))
         buf = Vector{UInt8}(undef, Int(need))
-        ccall(np, Cint, (Cint, Cint, Ptr{UInt8}, Cint), id, Cint(k), buf, need)
+        ccall(np, Int64, (Int64, Int64, Ptr{UInt8}, Int64), id, Int64(k), buf, need)
         name = Symbol(String(buf))
         nd = Int(out[4])
         b = BlockRef(name,
                      out[1] == 0 ? :var : out[1] == 1 ? :con : :par,
                      Int(out[2]), Int(out[3]),
                      Dims(Int(out[4 + i]) for i in 1:nd),
-                     Cint(k))
+                     Int64(k))
         push!(b.kind === :var ? vars : b.kind === :con ? cons : pars, name => b)
     end
     return (NamedTuple(vars), NamedTuple(cons), NamedTuple(pars))
@@ -294,7 +286,7 @@ end
 @noinline _status_error(sym, st) =
     error("$sym returned nonzero status $st")
 
-@inline function _check(st::Cint, sym::Symbol)
+@inline function _check(st::Int64, sym::Symbol)
     st == 0 || _status_error(sym, st)
     return nothing
 end
@@ -314,9 +306,9 @@ function schema_json(lib::CLib; prefix::AbstractString = "rec")
     # one value or none, and `argtype` says which. Returning `nothing` lets a
     # caller ask about any model uniformly.
     fp === nothing && return nothing
-    n = ccall(fp, Cint, (Ptr{UInt8}, Cint), C_NULL, Cint(0))
+    n = ccall(fp, Int64, (Ptr{UInt8}, Int64), C_NULL, Int64(0))
     buf = Vector{UInt8}(undef, Int(n))
-    ccall(fp, Cint, (Ptr{UInt8}, Cint), buf, n)
+    ccall(fp, Int64, (Ptr{UInt8}, Int64), buf, n)
     return String(buf)
 end
 
@@ -386,14 +378,14 @@ function _instantiate(lib::CLib, prefix::AbstractString, args::Tuple)
         p === nothing && error(
             "`$prefix` has no string entry point (`$(prefix)_new_str`); its " *
             "signature is `" * _argtype(lib, prefix) * "`")
-        id = ccall(p, Cint, (Cstring,), String(args[1]))
+        id = ccall(p, Int64, (Cstring,), String(args[1]))
         id > 0 || _status_error(Symbol(prefix, "_new_str"), id)
         return id
     end
     if length(args) == 1 && args[1] isa Integer
         p = Libdl.dlsym(lib.handle, Symbol(prefix, "_new"); throw_error = false)
         if p !== nothing
-            id = ccall(p, Cint, (Cint,), Cint(args[1]))
+            id = ccall(p, Int64, (Int64,), Int64(args[1]))
             id > 0 || _status_error(Symbol(prefix, "_new"), id)
             return id
         end
@@ -406,9 +398,9 @@ function _instantiate(lib::CLib, prefix::AbstractString, args::Tuple)
     # the other legitimate "no instance data" case).
     if isempty(args)
         q = Libdl.dlsym(lib.handle, Symbol(prefix, "_nargs"); throw_error = false)
-        if q !== nothing && ccall(q, Cint, ()) == 0
+        if q !== nothing && ccall(q, Int64, ()) == 0
             p = Libdl.dlsym(lib.handle, Symbol(prefix, "_new"))
-            id = ccall(p, Cint, (Cint,), Cint(0))
+            id = ccall(p, Int64, (Int64,), Int64(0))
             id > 0 || _status_error(Symbol(prefix, "_new"), id)
             return id
         end
@@ -437,17 +429,17 @@ end
 # are arrays, vectors of named tuples are tables (sent column-by-column). The
 # library itself validates names, kinds, completeness and column lengths.
 _push_field(fp, sym, b, f, val::AbstractFloat) =
-    _check(ccall(fp(:set_scalar_f64), Cint, (Cint, Cstring, Cdouble),
+    _check(ccall(fp(:set_scalar_f64), Int64, (Int64, Cstring, Cdouble),
         b, f, Cdouble(val)), sym(:set_scalar_f64))
 _push_field(fp, sym, b, f, val::Integer) =
-    _check(ccall(fp(:set_scalar_i64), Cint, (Cint, Cstring, Clonglong),
+    _check(ccall(fp(:set_scalar_i64), Int64, (Int64, Cstring, Clonglong),
         b, f, Clonglong(val)), sym(:set_scalar_i64))
 _push_field(fp, sym, b, f, val::AbstractVector{<:AbstractFloat}) =
-    _check(ccall(fp(:set_array_f64), Cint, (Cint, Cstring, Ptr{Cdouble}, Cint),
-        b, f, convert(Vector{Float64}, val), Cint(length(val))), sym(:set_array_f64))
+    _check(ccall(fp(:set_array_f64), Int64, (Int64, Cstring, Ptr{Cdouble}, Int64),
+        b, f, convert(Vector{Float64}, val), Int64(length(val))), sym(:set_array_f64))
 _push_field(fp, sym, b, f, val::AbstractVector{<:Integer}) =
-    _check(ccall(fp(:set_array_i64), Cint, (Cint, Cstring, Ptr{Clonglong}, Cint),
-        b, f, convert(Vector{Int64}, val), Cint(length(val))), sym(:set_array_i64))
+    _check(ccall(fp(:set_array_i64), Int64, (Int64, Cstring, Ptr{Clonglong}, Int64),
+        b, f, convert(Vector{Int64}, val), Int64(length(val))), sym(:set_array_i64))
 function _push_field(fp, sym, b, f, val::AbstractVector{<:NamedTuple})
     for cn in fieldnames(eltype(val))
         _push_col(fp, sym, b, f, string(cn), [getfield(r, cn) for r in val])
@@ -458,25 +450,25 @@ _push_field(fp, sym, b, f, val) =
           "numeric vectors, or vectors of named tuples of numbers")
 
 _push_col(fp, sym, b, f, c, col::AbstractVector{<:AbstractFloat}) =
-    _check(ccall(fp(:set_col_f64), Cint, (Cint, Cstring, Cstring, Ptr{Cdouble}, Cint),
-        b, f, c, convert(Vector{Float64}, col), Cint(length(col))), sym(:set_col_f64))
+    _check(ccall(fp(:set_col_f64), Int64, (Int64, Cstring, Cstring, Ptr{Cdouble}, Int64),
+        b, f, c, convert(Vector{Float64}, col), Int64(length(col))), sym(:set_col_f64))
 _push_col(fp, sym, b, f, c, col::AbstractVector{<:Integer}) =
-    _check(ccall(fp(:set_col_i64), Cint, (Cint, Cstring, Cstring, Ptr{Clonglong}, Cint),
-        b, f, c, convert(Vector{Int64}, col), Cint(length(col))), sym(:set_col_i64))
+    _check(ccall(fp(:set_col_i64), Int64, (Int64, Cstring, Cstring, Ptr{Clonglong}, Int64),
+        b, f, c, convert(Vector{Int64}, col), Int64(length(col))), sym(:set_col_i64))
 _push_col(fp, sym, b, f, c, col) =
     error("unsupported column type $(eltype(col)) for $f.$c")
 
 function _fill_data(lib::CLib, prefix::AbstractString, data::NamedTuple)
     sym(s) = Symbol(prefix, "_", s)
     fp(s) = Libdl.dlsym(lib.handle, sym(s))
-    b = ccall(fp(:data_begin), Cint, ())
+    b = ccall(fp(:data_begin), Int64, ())
     b > 0 || _status_error(sym(:data_begin), b)
     for (fname, val) in pairs(data)
         _push_field(fp, sym, b, string(fname), val)
     end
-    ccall(fp(:data_ready), Cint, (Cint,), b) == 1 ||
+    ccall(fp(:data_ready), Int64, (Int64,), b) == 1 ||
         error("library reports data incomplete or inconsistent after all fields were set")
-    id = ccall(fp(:new_from_data), Cint, (Cint,), b)
+    id = ccall(fp(:new_from_data), Int64, (Int64,), b)
     id > 0 || _status_error(sym(:new_from_data), id)
     return id
 end
@@ -510,45 +502,56 @@ function CNLPModel(
     args...;
     prefix::AbstractString = "rec",
     name::AbstractString = basename(lib.path),
+    device::Symbol = :cpu,
+    input::Union{Nothing, Pair} = nothing,
 )
     sym(s) = Symbol(prefix, "_", s)
     fp(s) = Libdl.dlsym(lib.handle, sym(s))
 
-    id = _instantiate(lib, prefix, args)
+    # `input = :name => path`: instantiate through one of the model's own
+    # instance readers (the readers tier) instead of its entry point.
+    id = if input === nothing
+        _instantiate(lib, prefix, args)
+    else
+        isempty(args) || throw(ArgumentError("give either instantiation arguments or `input`, not both"))
+        _instantiate_reader(lib, prefix, Symbol(first(input)), String(last(input)))
+    end
     # The library's runtime is fully initialized by now: repair whatever its
     # lazy initialization did to the shared trampoline.
     restore_blas!(lib)
 
-    nvar = Int(ccall(fp(:nvar), Cint, (Cint,), id))
-    ncon = Int(ccall(fp(:ncon), Cint, (Cint,), id))
-    nnzj = Int(ccall(fp(:nnzj), Cint, (Cint,), id))
-    nnzh = Int(ccall(fp(:nnzh), Cint, (Cint,), id))
+    nvar = Int(ccall(fp(:nvar), Int64, (Int64,), id))
+    ncon = Int(ccall(fp(:ncon), Int64, (Int64,), id))
+    nnzj = Int(ccall(fp(:nnzj), Int64, (Int64,), id))
+    nnzh = Int(ccall(fp(:nnzh), Int64, (Int64,), id))
 
     x0 = zeros(nvar); lvar = zeros(nvar); uvar = zeros(nvar)
     lcon = zeros(ncon); ucon = zeros(ncon)
-    st = ccall(fp(:meta), Cint,
-        (Cint, Ptr{Cdouble}, Ptr{Cdouble}, Ptr{Cdouble}, Ptr{Cdouble}, Ptr{Cdouble}),
+    st = ccall(fp(:meta), Int64,
+        (Int64, Ptr{Cdouble}, Ptr{Cdouble}, Ptr{Cdouble}, Ptr{Cdouble}, Ptr{Cdouble}),
         id, x0, lvar, uvar, lcon, ucon)
     _check(st, sym(:meta))
+
+    # The objective sense is optional in the ABI: a library without P_minimize
+    # minimizes.
+    mp = Libdl.dlsym(lib.handle, sym(:minimize); throw_error = false)
+    minimize = mp === nothing ? true : ccall(mp, Int64, (Int64,), id) != 0
 
     meta = NLPModelMeta(
         nvar; ncon = ncon, nnzj = nnzj, nnzh = nnzh,
         x0 = x0, lvar = lvar, uvar = uvar, lcon = lcon, ucon = ucon,
-        minimize = true, name = String(name),
+        minimize = minimize, name = String(name),
     )
     vars, cons, pars = _read_layout(lib, prefix, id)
+    jrows, jcols = _structure(fp(:jac_structure), id, nnzj, sym(:jac_structure))
+    hrows, hcols = _structure(fp(:hess_structure), id, nnzh, sym(:hess_structure))
     m = CNLPModel(
         meta, Counters(), lib, id,
-        fp(:obj), fp(:grad), fp(:cons),
-        fp(:jac_structure), fp(:jac), fp(:hess_structure), fp(:hess),
-        Vector{Int}(undef, nnzj), Vector{Int}(undef, nnzj),
-        Vector{Float64}(undef, nnzj),
-        Vector{Int}(undef, nnzh), Vector{Int}(undef, nnzh),
-        Vector{Float64}(undef, nnzh),
+        fp(:obj), fp(:grad), fp(:cons), fp(:jac), fp(:hess),
+        jrows, jcols, hrows, hcols, jrows, jcols, hrows, hcols,
+        Vector{Float64}(undef, nnzj), Vector{Float64}(undef, nnzh), zeros(ncon),
         String(prefix), vars, cons, pars,
     )
-    NLPModels.jac_structure!(m, m.jrows, m.jcols)
-    NLPModels.hess_structure!(m, m.hrows, m.hcols)
     # Restore once more on the way out: the structure calls above are the
     # first entries into THIS model's generated code, and in a multi-model
     # library a later model's first calls can lazily clobber the trampoline
@@ -556,7 +559,27 @@ function CNLPModel(
     # an OPF library printing `no BLAS/LAPACK library loaded for dcopy_()`
     # at solve time until an explicit restore.
     restore_blas!(lib)
-    return m
+    device === :cpu && return m
+    # The device tier (`P_device`, `P_*_d`): a model on the same instance whose
+    # metadata and buffers live on the device. Provided by a package extension.
+    hasmethod(_device_model, Tuple{Val{device}, typeof(m)}) || throw(ArgumentError(
+        "`device = :$device` needs its extension loaded (for :cuda, `using CUDA` or `using CUDACore`)"))
+    return _device_model(Val(device), m)
+end
+
+"""
+    _device_model(::Val{device}, m::CNLPModel)
+
+The same instance as `m` with `VT` on `device`, evaluated through the device tier.
+Methods live in package extensions.
+"""
+function _device_model end
+
+# A sparsity structure (1-based COO), read from the library.
+function _structure(fp::Ptr{Cvoid}, id::Int64, nnz::Int, name::Symbol)
+    r = Vector{Int}(undef, nnz); c = Vector{Int}(undef, nnz)
+    _check(ccall(fp, Int64, (Int64, Ptr{Int64}, Ptr{Int64}), id, r, c), name)
+    return r, c
 end
 
 """
@@ -611,10 +634,12 @@ Omitting the symbol keeps the single-model spelling, where the prefix falls back
 to the library name — so a one-model library is unaffected.
 """
 function CNLPModel(
-    lib::CLib, model::Symbol, args...; name::AbstractString = String(model),
+    lib::CLib, model::Symbol, args...; name::AbstractString = String(model), kwargs...,
 )
+    # naming the model and passing `prefix=` are the same knob: not both
+    haskey(kwargs, :prefix) && throw(MethodError(CNLPModel, (lib, model, args...)))
     _require_model(lib, model)
-    return CNLPModel(lib, args...; prefix = String(model), name = name)
+    return CNLPModel(lib, args...; prefix = String(model), name = name, kwargs...)
 end
 
 # A name this library does not carry must be reported HERE. `_nvar` is the
@@ -697,10 +722,10 @@ argtype(spec::AbstractString, model::Union{Symbol, AbstractString}) =
 function _argtype(lib::CLib, prefix::AbstractString)
     fp = Libdl.dlsym(lib.handle, Symbol(prefix, "_argtype"); throw_error = false)
     fp === nothing && return ""
-    n = ccall(fp, Cint, (Ptr{UInt8}, Cint), C_NULL, Cint(0))
+    n = ccall(fp, Int64, (Ptr{UInt8}, Int64), C_NULL, Int64(0))
     n <= 0 && return ""
     buf = Vector{UInt8}(undef, Int(n))
-    ccall(fp, Cint, (Ptr{UInt8}, Cint), buf, n)
+    ccall(fp, Int64, (Ptr{UInt8}, Int64), buf, n)
     return String(buf)
 end
 
@@ -726,14 +751,14 @@ available_models(spec::AbstractString) = _catalogue(_resolve_spec(spec))
 function _catalogue(lib::CLib)
     n = Libdl.dlsym(lib.handle, :cnlp_nmodels; throw_error = false)
     n === nothing && return Symbol[]
-    count = ccall(n, Cint, ())
+    count = ccall(n, Int64, ())
     count <= 0 && return Symbol[]
     np = Libdl.dlsym(lib.handle, :cnlp_model_name)
     out = Vector{Symbol}(undef, Int(count))
     for k in 0:(Int(count) - 1)
-        need = ccall(np, Cint, (Cint, Ptr{UInt8}, Cint), Cint(k), C_NULL, Cint(0))
+        need = ccall(np, Int64, (Int64, Ptr{UInt8}, Int64), Int64(k), C_NULL, Int64(0))
         buf = Vector{UInt8}(undef, Int(need))
-        ccall(np, Cint, (Cint, Ptr{UInt8}, Cint), Cint(k), buf, need)
+        ccall(np, Int64, (Int64, Ptr{UInt8}, Int64), Int64(k), buf, need)
         out[k + 1] = Symbol(String(buf))
     end
     return out
@@ -864,8 +889,8 @@ function get_value(m::CNLPModel, b::BlockRef)
     b.kind === :par || throw(ArgumentError("`$(b.name)` is a $(b.kind), not a parameter"))
     out = Vector{Float64}(undef, b.length)
     fp = Libdl.dlsym(m.lib.handle, Symbol(m.prefix, "_get_value"))
-    _check(ccall(fp, Cint, (Cint, Cint, Ptr{Cdouble}, Cint),
-                 m.id, b.index, out, Cint(b.length)), Symbol(m.prefix, "_get_value"))
+    _check(ccall(fp, Int64, (Int64, Int64, Ptr{Cdouble}, Int64),
+                 m.id, b.index, out, Int64(b.length)), Symbol(m.prefix, "_get_value"))
     return reshape(out, b.dims...)
 end
 
@@ -876,42 +901,59 @@ function set_value!(m::CNLPModel, b::BlockRef, values)
     length(v) == b.length || throw(DimensionMismatch(
         "parameter `$(b.name)` has $(b.length) elements, got $(length(v))"))
     fp = Libdl.dlsym(m.lib.handle, Symbol(m.prefix, "_set_value"))
-    _check(ccall(fp, Cint, (Cint, Cint, Ptr{Cdouble}, Cint),
-                 m.id, b.index, v, Cint(b.length)), Symbol(m.prefix, "_set_value"))
+    _check(ccall(fp, Int64, (Int64, Int64, Ptr{Cdouble}, Int64),
+                 m.id, b.index, v, Int64(b.length)), Symbol(m.prefix, "_set_value"))
     return m
 end
+
+# ── evaluation, for every VT ──────────────────────────────────────────────────────
+# Two hooks are specialized per storage by the extensions: `_ptr`, an array as the raw
+# pointer the ABI takes (a host array converts itself in `ccall`), and `_sync`, which
+# orders the library's reads after our writes (a no-op on the host). The products
+# assemble from the COO values the ABI provides through `_coo_mul!` and `_sym_mul!`.
+
+_ptr(a::AbstractVector{Float64}) = a
+_sync(::CNLPModel) = nothing
 
 function NLPModels.obj(m::CNLPModel, x::AbstractVector{Float64})
     @lencheck m.meta.nvar x
     increment!(m, :neval_obj)
+    _sync(m)
     out = Ref{Cdouble}(0.0)
-    _check(ccall(m.obj_p, Cint, (Cint, Ptr{Cdouble}, Ptr{Cdouble}), m.id, x, out), :obj)
+    _check(ccall(m.obj_p, Int64, (Int64, Ptr{Cdouble}, Ptr{Cdouble}), m.id, _ptr(x), out), :obj)
     return out[]
 end
 
 function NLPModels.grad!(m::CNLPModel, x::AbstractVector{Float64}, g::AbstractVector{Float64})
     @lencheck m.meta.nvar x g
     increment!(m, :neval_grad)
-    _check(ccall(m.grad_p, Cint, (Cint, Ptr{Cdouble}, Ptr{Cdouble}), m.id, x, g), :grad)
+    _sync(m)
+    _check(ccall(m.grad_p, Int64, (Int64, Ptr{Cdouble}, Ptr{Cdouble}), m.id, _ptr(x), _ptr(g)), :grad)
     return g
 end
 
-function NLPModels.cons!(m::CNLPModel, x::AbstractVector{Float64}, c::AbstractVector{Float64})
-    @lencheck m.meta.nvar x
-    @lencheck m.meta.ncon c
-    increment!(m, :neval_cons)
-    _check(ccall(m.cons_p, Cint, (Cint, Ptr{Cdouble}, Ptr{Cdouble}), m.id, x, c), :cons)
-    return c
+# The ABI draws no linear/nonlinear distinction: all constraints are nonlinear.
+for (fn, inc) in ((:cons!, :neval_cons), (:cons_nln!, :neval_cons_nln))
+    @eval function NLPModels.$fn(m::CNLPModel, x::AbstractVector{Float64}, c::AbstractVector{Float64})
+        @lencheck m.meta.nvar x
+        @lencheck m.meta.ncon c
+        increment!(m, $(QuoteNode(inc)))
+        m.meta.ncon == 0 && return c
+        _sync(m)
+        _check(ccall(m.cons_p, Int64, (Int64, Ptr{Cdouble}, Ptr{Cdouble}), m.id, _ptr(x), _ptr(c)), :cons)
+        return c
+    end
 end
 
-function NLPModels.jac_structure!(
-    m::CNLPModel, rows::AbstractVector{<:Integer}, cols::AbstractVector{<:Integer},
-)
+function NLPModels.jac_structure!(m::CNLPModel, rows::AbstractVector{<:Integer}, cols::AbstractVector{<:Integer})
     @lencheck m.meta.nnzj rows cols
-    r = Vector{Cint}(undef, m.meta.nnzj)
-    c = Vector{Cint}(undef, m.meta.nnzj)
-    _check(ccall(m.jac_structure_p, Cint, (Cint, Ptr{Cint}, Ptr{Cint}), m.id, r, c), :jac_structure)
-    copyto!(rows, r); copyto!(cols, c)
+    copyto!(rows, m.jrows); copyto!(cols, m.jcols)
+    return rows, cols
+end
+
+function NLPModels.hess_structure!(m::CNLPModel, rows::AbstractVector{<:Integer}, cols::AbstractVector{<:Integer})
+    @lencheck m.meta.nnzh rows cols
+    copyto!(rows, m.hrows); copyto!(cols, m.hcols)
     return rows, cols
 end
 
@@ -919,53 +961,10 @@ function NLPModels.jac_coord!(m::CNLPModel, x::AbstractVector{Float64}, vals::Ab
     @lencheck m.meta.nvar x
     @lencheck m.meta.nnzj vals
     increment!(m, :neval_jac)
-    _check(ccall(m.jac_p, Cint, (Cint, Ptr{Cdouble}, Ptr{Cdouble}), m.id, x, vals), :jac)
+    m.meta.nnzj == 0 && return vals
+    _sync(m)
+    _check(ccall(m.jac_p, Int64, (Int64, Ptr{Cdouble}, Ptr{Cdouble}), m.id, _ptr(x), _ptr(vals)), :jac)
     return vals
-end
-
-function NLPModels.hess_structure!(
-    m::CNLPModel, rows::AbstractVector{<:Integer}, cols::AbstractVector{<:Integer},
-)
-    @lencheck m.meta.nnzh rows cols
-    r = Vector{Cint}(undef, m.meta.nnzh)
-    c = Vector{Cint}(undef, m.meta.nnzh)
-    _check(ccall(m.hess_structure_p, Cint, (Cint, Ptr{Cint}, Ptr{Cint}), m.id, r, c), :hess_structure)
-    copyto!(rows, r); copyto!(cols, c)
-    return rows, cols
-end
-
-for (fn, inc) in ((:jprod_nln!, :neval_jprod), (:jprod!, :neval_jprod))
-    @eval function NLPModels.$fn(
-        m::CNLPModel, x::AbstractVector{Float64}, v::AbstractVector{Float64},
-        Jv::AbstractVector{Float64},
-    )
-        @lencheck m.meta.nvar x v
-        @lencheck m.meta.ncon Jv
-        increment!(m, $(QuoteNode(inc)))
-        NLPModels.jac_coord!(m, x, m.jbuf)
-        fill!(Jv, 0.0)
-        @inbounds for k in eachindex(m.jbuf)
-            Jv[m.jrows[k]] += m.jbuf[k] * v[m.jcols[k]]
-        end
-        return Jv
-    end
-end
-
-for (fn, inc) in ((:jtprod_nln!, :neval_jtprod), (:jtprod!, :neval_jtprod))
-    @eval function NLPModels.$fn(
-        m::CNLPModel, x::AbstractVector{Float64}, v::AbstractVector{Float64},
-        Jtv::AbstractVector{Float64},
-    )
-        @lencheck m.meta.nvar x Jtv
-        @lencheck m.meta.ncon v
-        increment!(m, $(QuoteNode(inc)))
-        NLPModels.jac_coord!(m, x, m.jbuf)
-        fill!(Jtv, 0.0)
-        @inbounds for k in eachindex(m.jbuf)
-            Jtv[m.jcols[k]] += m.jbuf[k] * v[m.jrows[k]]
-        end
-        return Jtv
-    end
 end
 
 function NLPModels.hess_coord!(
@@ -976,63 +975,349 @@ function NLPModels.hess_coord!(
     @lencheck m.meta.ncon y
     @lencheck m.meta.nnzh vals
     increment!(m, :neval_hess)
-    _check(ccall(m.hess_p, Cint,
-        (Cint, Ptr{Cdouble}, Ptr{Cdouble}, Cdouble, Ptr{Cdouble}),
-        m.id, x, y, Cdouble(obj_weight), vals), :hess)
+    m.meta.nnzh == 0 && return vals
+    _sync(m)
+    _check(ccall(m.hess_p, Int64, (Int64, Ptr{Cdouble}, Ptr{Cdouble}, Cdouble, Ptr{Cdouble}),
+                 m.id, _ptr(x), _ptr(y), Cdouble(obj_weight), _ptr(vals)), :hess)
     return vals
 end
 
-function NLPModels.hess_coord!(
-    m::CNLPModel, x::AbstractVector{Float64}, vals::AbstractVector{Float64};
-    obj_weight::Real = 1.0,
-)
-    return NLPModels.hess_coord!(m, x, zeros(m.meta.ncon), vals; obj_weight = obj_weight)
+NLPModels.hess_coord!(m::CNLPModel, x::AbstractVector{Float64}, vals::AbstractVector{Float64};
+                      obj_weight::Real = 1.0) =
+    NLPModels.hess_coord!(m, x, m.zeroy, vals; obj_weight)
+
+# y = A v for COO (rows, cols, vals), and for a lower triangle stored as COO.
+function _coo_mul!(y, rows, cols, vals, v)
+    fill!(y, 0.0)
+    @inbounds for k in eachindex(vals)
+        y[rows[k]] += vals[k] * v[cols[k]]
+    end
+    return y
+end
+function _sym_mul!(y, rows, cols, vals, v)
+    fill!(y, 0.0)
+    @inbounds for k in eachindex(vals)
+        i, j, h = rows[k], cols[k], vals[k]
+        y[i] += h * v[j]
+        i == j || (y[j] += h * v[i])
+    end
+    return y
 end
 
-# All constraints are nonlinear here — the ABI draws no linear/nonlinear
-# distinction — so the _nln spellings some solver code paths call are the
-# plain ones.
-function NLPModels.cons_nln!(
-    m::CNLPModel, x::AbstractVector{Float64}, c::AbstractVector{Float64},
-)
-    @lencheck m.meta.nvar x
-    @lencheck m.meta.ncon c
-    increment!(m, :neval_cons_nln)
-    _check(ccall(m.cons_p, Cint, (Cint, Ptr{Cdouble}, Ptr{Cdouble}), m.id, x, c), :cons)
-    return c
+for (fn, inc) in ((:jprod_nln!, :neval_jprod), (:jprod!, :neval_jprod))
+    @eval function NLPModels.$fn(m::CNLPModel, x::AbstractVector{Float64}, v::AbstractVector{Float64},
+                                 Jv::AbstractVector{Float64})
+        @lencheck m.meta.nvar x v
+        @lencheck m.meta.ncon Jv
+        increment!(m, $(QuoteNode(inc)))
+        NLPModels.jac_coord!(m, x, m.jbuf)
+        return _coo_mul!(Jv, m.vjrows, m.vjcols, m.jbuf, v)
+    end
 end
 
-# Hessian-vector product, assembled from the COO Hessian the ABI provides:
-# one `P_hess` evaluation into the cached buffer, then a symmetric matvec
-# over the lower triangle (off-diagonal entries contribute both ways). This
-# is what lets matrix-free solvers run against a compiled model at all; a
-# library wanting true matrix-free products is a future ABI addition, and
-# this stays the fallback for libraries without one.
+for (fn, inc) in ((:jtprod_nln!, :neval_jtprod), (:jtprod!, :neval_jtprod))
+    @eval function NLPModels.$fn(m::CNLPModel, x::AbstractVector{Float64}, v::AbstractVector{Float64},
+                                 Jtv::AbstractVector{Float64})
+        @lencheck m.meta.nvar x Jtv
+        @lencheck m.meta.ncon v
+        increment!(m, $(QuoteNode(inc)))
+        NLPModels.jac_coord!(m, x, m.jbuf)
+        return _coo_mul!(Jtv, m.vjcols, m.vjrows, m.jbuf, v)
+    end
+end
+
 function NLPModels.hprod!(
     m::CNLPModel, x::AbstractVector{Float64}, y::AbstractVector{Float64},
-    v::AbstractVector{Float64}, Hv::AbstractVector{Float64};
-    obj_weight::Real = 1.0,
+    v::AbstractVector{Float64}, Hv::AbstractVector{Float64}; obj_weight::Real = 1.0,
 )
     @lencheck m.meta.nvar x v Hv
     @lencheck m.meta.ncon y
     increment!(m, :neval_hprod)
-    _check(ccall(m.hess_p, Cint,
-        (Cint, Ptr{Cdouble}, Ptr{Cdouble}, Cdouble, Ptr{Cdouble}),
-        m.id, x, y, Cdouble(obj_weight), m.hbuf), :hess)
-    fill!(Hv, 0.0)
-    @inbounds for k in eachindex(m.hbuf)
-        i, j, h = m.hrows[k], m.hcols[k], m.hbuf[k]
-        Hv[i] += h * v[j]
-        i == j || (Hv[j] += h * v[i])
-    end
-    return Hv
+    NLPModels.hess_coord!(m, x, y, m.hbuf; obj_weight)
+    return _sym_mul!(Hv, m.vhrows, m.vhcols, m.hbuf, v)
 end
 
-function NLPModels.hprod!(
-    m::CNLPModel, x::AbstractVector{Float64}, v::AbstractVector{Float64},
-    Hv::AbstractVector{Float64}; obj_weight::Real = 1.0,
+NLPModels.hprod!(m::CNLPModel, x::AbstractVector{Float64}, v::AbstractVector{Float64},
+                 Hv::AbstractVector{Float64}; obj_weight::Real = 1.0) =
+    NLPModels.hprod!(m, x, m.zeroy, v, Hv; obj_weight)
+
+# ── solution writers ─────────────────────────────────────────────────────────────
+# A library may carry writers for its models (P_nwriters, P_writer_name,
+# P_write_<name>): code that turns a solution into the model's own file format,
+# such as a solved MATPOWER case. They run on the host.
+
+"""
+    writers(m) -> Vector{Symbol}
+
+The solution writers the library carries for this model; empty if none.
+"""
+function writers(m::CNLPModel)
+    np = Libdl.dlsym(m.lib.handle, Symbol(m.prefix, "_nwriters"); throw_error = false)
+    np === nothing && return Symbol[]
+    fp = Libdl.dlsym(m.lib.handle, Symbol(m.prefix, "_writer_name"))
+    out = Symbol[]
+    for k in 0:(Int(ccall(np, Int64, ())) - 1)
+        n = ccall(fp, Int64, (Int64, Ptr{UInt8}, Int64), k, C_NULL, 0)
+        buf = Vector{UInt8}(undef, n)
+        ccall(fp, Int64, (Int64, Ptr{UInt8}, Int64), k, buf, n)
+        push!(out, Symbol(String(buf)))
+    end
+    return out
+end
+
+"""
+    write_solution(m, writer, path, result)
+    write_solution(m, writer, path, x, y, zl, zu; objective, status = "")
+
+Write a solution with one of the library's writers (see [`writers`](@ref)).
+`result` is a solver result with `solution`, `multipliers`, `multipliers_L`,
+`multipliers_U`, `objective` and `status` (MadNLP's, NLPModelsIpopt's), in the
+NLPModels sign convention, which is converted to the cnlp one for a maximizing model.
+The explicit form takes `y`, `zl`, `zu` already in the cnlp convention
+(σ∇f + Jᵀy − zL + zU = 0, cnlp-solution 2.1). Arrays on a device are copied to the
+host first.
+"""
+function write_solution(m::CNLPModel, writer::Symbol, path::AbstractString,
+                        x::AbstractVector, y::AbstractVector, zl::AbstractVector, zu::AbstractVector;
+                        objective::Real, status::AbstractString = "")
+    writer in writers(m) || throw(ArgumentError("`$(m.prefix)` has no writer `$writer`; it has $(writers(m))"))
+    @lencheck m.meta.nvar x zl zu
+    @lencheck m.meta.ncon y
+    fp = Libdl.dlsym(m.lib.handle, Symbol(m.prefix, "_write_", writer))
+    hx, hy, hl, hu = (Vector{Float64}(Array(v)) for v in (x, y, zl, zu))
+    st = ccall(fp, Int64, (Int64, Cstring, Ptr{Cdouble}, Ptr{Cdouble}, Ptr{Cdouble}, Ptr{Cdouble}, Cdouble, Cstring),
+               m.id, path, hx, hy, hl, hu, Cdouble(objective), status)
+    st == 0 || error("writer `$writer` of `$(m.prefix)` could not write $path (status $st)")
+    return path
+end
+
+function write_solution(m::CNLPModel, writer::Symbol, path::AbstractString, result)
+    y, zl, zu = _to_cnlp_signs(m, result.multipliers, result.multipliers_L, result.multipliers_U)
+    return write_solution(m, writer, path, result.solution, y, zl, zu;
+                          objective = result.objective, status = string(result.status))
+end
+
+# Multiplier signs. A cnlp solution satisfies σ∇f + Jᵀy − zL + zU = 0 (σ = −1 when the model
+# maximizes; cnlp-solution 2.1). NLPModels/SolverCore results (MadNLP, NLPModelsIpopt) satisfy
+# ∇f + Jᵀy − zL + zU = 0, so for a maximizing model all three are negated, each way.
+_to_cnlp_signs(m::CNLPModel, y, zl, zu) =
+    m.meta.minimize ? (y, zl, zu) : (-Array(y), -Array(zl), -Array(zu))
+_from_cnlp_signs(m::CNLPModel, y, zl, zu) = _to_cnlp_signs(m, y, zl, zu)
+
+# ── the standard solution format (cnlp-solution 0.2: formats/solution.md) ──────────
+# HDF5, written by the HDF5 extension (`using HDF5`): root attributes, the `/solution`
+# group (as ExaModelsIO stores a solution) and `/blocks/<kind>/<name>`. Other encodings
+# are a library's writers.
+
+# Solver statuses (MadNLP, SolverCore) mapped to the solver-neutral ones.
+const _STATUS = Dict(
+    "SOLVE_SUCCEEDED" => "solved", "SOLVED_TO_ACCEPTABLE_LEVEL" => "acceptable",
+    "INFEASIBLE_PROBLEM_DETECTED" => "infeasible", "DIVERGING_ITERATES" => "unbounded",
+    "MAXIMUM_ITERATIONS_EXCEEDED" => "iteration_limit", "MAXIMUM_WALLTIME_EXCEEDED" => "time_limit",
+    "first_order" => "solved", "acceptable" => "acceptable", "infeasible" => "infeasible",
+    "unbounded" => "unbounded", "max_iter" => "iteration_limit", "max_time" => "time_limit",
 )
-    return NLPModels.hprod!(m, x, zeros(m.meta.ncon), v, Hv; obj_weight = obj_weight)
+_status(s) = get(_STATUS, string(s), "error")
+
+# c(x) through the host callback, whatever VT the model evaluates on.
+function _host_cons(m::CNLPModel, x::Vector{Float64})
+    c = zeros(m.meta.ncon)
+    m.meta.ncon == 0 && return c
+    fp = Libdl.dlsym(m.lib.handle, Symbol(m.prefix, "_cons"))
+    _check(ccall(fp, Int64, (Int64, Ptr{Cdouble}, Ptr{Cdouble}), m.id, x, c), Symbol(m.prefix, "_cons"))
+    return c
+end
+
+# The solution as plain host data, organized by the library's named blocks.
+function _solution_record(m::CNLPModel, result)
+    x = Vector{Float64}(Array(result.solution))
+    y, zl, zu = (Vector{Float64}(Array(v)) for v in
+                 _to_cnlp_signs(m, result.multipliers, result.multipliers_L, result.multipliers_U))
+    c = _host_cons(m, x)
+    sl(v, b) = reshape(v[(b.offset + 1):(b.offset + b.length)], b.dims...)
+    blocks = Tuple{String,String,Vector{Pair{String,Array{Float64}}}}[]
+    for (name, b) in pairs(get_vars(m))
+        push!(blocks, ("variables", String(name), ["value" => sl(x, b),
+            "multiplier_L" => sl(zl, b), "multiplier_U" => sl(zu, b)]))
+    end
+    for (name, b) in pairs(get_cons(m))
+        push!(blocks, ("constraints", String(name), ["value" => sl(c, b), "multiplier" => sl(y, b)]))
+    end
+    for (name, b) in pairs(get_pars(m))
+        push!(blocks, ("parameters", String(name), ["value" => reshape(Vector{Float64}(get_value(m, b)), b.dims...)]))
+    end
+    return (; library = basename(m.lib.path), model = m.prefix, nvar = m.meta.nvar, ncon = m.meta.ncon,
+            minimize = m.meta.minimize, objective = Float64(result.objective),
+            status = _status(result.status), solver_status = string(result.status),
+            iterations = hasproperty(result, :iter) ? Int(result.iter) : -1, x, y, zl, zu, blocks)
+end
+
+# `_write_standard(path, record)` is defined by the HDF5 extension.
+function _write_standard end
+
+# The writer the library names as its default for this model, or `nothing`.
+function default_writer(m::CNLPModel)
+    fp = Libdl.dlsym(m.lib.handle, Symbol(m.prefix, "_default_writer"); throw_error = false)
+    fp === nothing && return nothing
+    n = ccall(fp, Int64, (Int64, Ptr{UInt8}, Int64), m.id, C_NULL, 0)
+    n <= 0 && return nothing
+    buf = Vector{UInt8}(undef, n)
+    ccall(fp, Int64, (Int64, Ptr{UInt8}, Int64), m.id, buf, n)
+    return Symbol(String(buf))
+end
+
+"""
+    write_solution(m, path, result; format = nothing)
+
+Write a solution in the model's default format: the library's default writer if it
+names one (e.g. a MATPOWER case), otherwise the standard cnlp-solution format (HDF5,
+needs `using HDF5`). `format` forces `:cnlp` (the standard format) or one of
+[`writers`](@ref).
+"""
+function write_solution(m::CNLPModel, path::AbstractString, result; format::Union{Nothing,Symbol} = nothing)
+    f = format !== nothing ? format : something(default_writer(m), :cnlp)
+    f === :cnlp || return write_solution(m, f, path, result)
+    isempty(methods(_write_standard)) && throw(ArgumentError("the standard solution format needs HDF5: `using HDF5`"))
+    return _write_standard(path, _solution_record(m, result))
+end
+
+# ── readers: the model's own input formats ──────────────────────────────────────
+# (cnlp.h, the readers tier). Kinds: :instance, :parameters, :start.
+
+const _READER_KINDS = (:instance, :parameters, :start)
+
+# The ABI string convention (call once to size, once to fill), for the two
+# shapes readers use: (buf, cap) and (k, buf, cap).
+function _copyout(fp)
+    n = ccall(fp, Int64, (Ptr{UInt8}, Int64), C_NULL, 0)
+    n <= 0 && return ""
+    buf = Vector{UInt8}(undef, n)
+    ccall(fp, Int64, (Ptr{UInt8}, Int64), buf, n)
+    return String(buf)
+end
+function _copyout(fp, k::Int64)
+    n = ccall(fp, Int64, (Int64, Ptr{UInt8}, Int64), k, C_NULL, 0)
+    n <= 0 && return ""
+    buf = Vector{UInt8}(undef, n)
+    ccall(fp, Int64, (Int64, Ptr{UInt8}, Int64), k, buf, n)
+    return String(buf)
+end
+
+"""
+    readers(lib, model::Symbol) -> Vector{Pair{Symbol,Symbol}}
+    readers(m) -> Vector{Pair{Symbol,Symbol}}
+
+The model's own input readers, as `name => kind` with kind `:instance`,
+`:parameters` or `:start`; empty if the library carries none.
+"""
+function readers(lib::CLib, model::Symbol)
+    np = Libdl.dlsym(lib.handle, Symbol(model, "_nreaders"); throw_error = false)
+    np === nothing && return Pair{Symbol,Symbol}[]
+    fn = Libdl.dlsym(lib.handle, Symbol(model, "_reader_name"))
+    fk = Libdl.dlsym(lib.handle, Symbol(model, "_reader_kind"))
+    return [Symbol(_copyout(fn, Int64(k))) => _READER_KINDS[ccall(fk, Int64, (Int64,), k) + 1]
+            for k in 0:(Int(ccall(np, Int64, ())) - 1)]
+end
+readers(m::CNLPModel) = readers(m.lib, Symbol(m.prefix))
+
+"""
+    default_reader(lib, model::Symbol) -> Union{Symbol,Nothing}
+
+The instance reader the model uses for a bare path, if it names one.
+"""
+function default_reader(lib::CLib, model::Symbol)
+    fp = Libdl.dlsym(lib.handle, Symbol(model, "_default_reader"); throw_error = false)
+    fp === nothing && return nothing
+    name = _copyout(fp)
+    return isempty(name) ? nothing : Symbol(name)
+end
+
+function _reader_of_kind(lib, prefix, name::Symbol, kind::Symbol)
+    rs = readers(lib, Symbol(prefix))
+    any(==(name => kind), rs) || throw(ArgumentError(
+        "`$prefix` has no $kind reader `$name`; its readers are $(isempty(rs) ? "none" : rs)"))
+    return nothing
+end
+
+function _instantiate_reader(lib::CLib, prefix::AbstractString, name::Symbol, path::String)
+    _reader_of_kind(lib, prefix, name, :instance)
+    fp = Libdl.dlsym(lib.handle, Symbol(prefix, "_new_from_", name))
+    id = ccall(fp, Int64, (Cstring,), path)
+    id > 0 || error("`$(prefix)_new_from_$(name)` could not create an instance from $path")
+    return id
+end
+
+"""
+    read_start(m, reader::Symbol, path) -> (; x0, y0, zl, zu)
+
+A starting point read from the model's own file format by one of its start
+readers, as host vectors, with the multipliers in the NLPModels sign convention
+(converted from the cnlp one for a maximizing model) so they go straight to an
+NLPModels solver. Use it to warm-start a solve, e.g. `madnlp(m; x0 = s.x0)` or by
+copying into `m.meta.x0`.
+"""
+function read_start(m::CNLPModel, reader::Symbol, path::AbstractString)
+    _reader_of_kind(m.lib, m.prefix, reader, :start)
+    n, k = m.meta.nvar, m.meta.ncon
+    x0, y0, zl, zu = zeros(n), zeros(k), zeros(n), zeros(n)
+    fp = Libdl.dlsym(m.lib.handle, Symbol(m.prefix, "_start_from_", reader))
+    _check(ccall(fp, Int64, (Int64, Cstring, Ptr{Cdouble}, Ptr{Cdouble}, Ptr{Cdouble}, Ptr{Cdouble}),
+                 m.id, path, x0, y0, zl, zu), Symbol(m.prefix, "_start_from_", reader))
+    y0, zl, zu = _from_cnlp_signs(m, y0, zl, zu)
+    return (; x0, y0, zl, zu)
+end
+
+"""
+    read_parameters!(m, reader::Symbol, path) -> m
+
+Set the model's parameters from its own file format, with one of its parameter
+readers. Live, like [`set_value!`](@ref).
+"""
+function read_parameters!(m::CNLPModel, reader::Symbol, path::AbstractString)
+    _reader_of_kind(m.lib, m.prefix, reader, :parameters)
+    fp = Libdl.dlsym(m.lib.handle, Symbol(m.prefix, "_set_from_", reader))
+    _check(ccall(fp, Int64, (Int64, Cstring), m.id, path), Symbol(m.prefix, "_set_from_", reader))
+    return m
+end
+
+
+# What a first use compiles (a traced load, construction and callbacks of a host model),
+# compiled here so it is in the package image. A statement naming something a dependency
+# no longer has is skipped.
+# The model API on the host storage type, compiled into the package image so the first
+# model of a session runs without compiling.
+let M = CNLPModel{Vector{Float64}, Vector{Int}}, V = Vector{Float64}, W = NamedTuple{(:obj_weight,), Tuple{Float64}}
+    precompile(CNLPModel, (CLib, Symbol, Int))
+    precompile(CNLPModel, (CLib, Int))
+    precompile(Core.kwcall, (NamedTuple{(:prefix,), Tuple{String}}, Type{CNLPModel}, CLib, Int))
+    for (f, args) in (
+        (NLPModels.obj, (M, V)), (NLPModels.grad, (M, V)), (NLPModels.grad!, (M, V, V)),
+        (NLPModels.cons, (M, V)), (NLPModels.cons!, (M, V, V)), (NLPModels.cons_nln!, (M, V, V)),
+        (NLPModels.jac_structure, (M,)), (NLPModels.hess_structure, (M,)),
+        (NLPModels.jac_coord, (M, V)), (NLPModels.jac_coord!, (M, V, V)),
+        (NLPModels.hess_coord, (M, V)), (NLPModels.hess_coord, (M, V, V)),
+        (NLPModels.hess_coord!, (M, V, V)), (NLPModels.hess_coord!, (M, V, V, V)),
+        (NLPModels.jprod, (M, V, V)), (NLPModels.jprod!, (M, V, V, V)),
+        (NLPModels.jtprod, (M, V, V)), (NLPModels.jtprod!, (M, V, V, V)),
+        (NLPModels.hprod, (M, V, V)), (NLPModels.hprod, (M, V, V, V)),
+        (NLPModels.hprod!, (M, V, V, V)), (NLPModels.hprod!, (M, V, V, V, V)),
+    )
+        precompile(f, args)
+        precompile(Core.kwcall, (W, typeof(f), args...))
+    end
+end
+
+module PrecompileStatements
+    for (id, m) in Base.loaded_modules
+        name = Symbol(id.name)
+        isdefined(@__MODULE__, name) || Core.eval(@__MODULE__, :(const $name = $m))
+    end
+    for line in eachline(joinpath(@__DIR__, "precompile_statements.jl"))
+        try
+            Core.eval(@__MODULE__, Meta.parse(line))
+        catch
+        end
+    end
 end
 
 end # module CNLPModels
