@@ -1,23 +1,26 @@
 """
-The HDF5 form of the standard solution format: ExaModelsIO's `/solution` group, so
-`ExaModelsIO.read_solution` reads it, plus `/blocks/<kind>/<name>/<field>`.
+The standard solution format, cnlp-solution 0.2 (formats/solution.md of cnlp-abi): root
+attributes, the `/solution` group ExaModelsIO also uses, and `/blocks/<kind>/<name>`.
 """
 module CNLPModelsHDF5Ext
 
 using CNLPModels, HDF5
 
-function CNLPModels._write_standard(::Val{:h5}, path::AbstractString, r)
+function CNLPModels._write_standard(path::AbstractString, r)
     h5open(path, "w") do f
         a = attributes(f)
-        a["format"] = "cnlp-solution"; a["format_version"] = "1.0"
-        a["library"] = r.library; a["model"] = r.model; a["minimize"] = Int(r.minimize)
+        a["format"] = "cnlp-solution"; a["format_version"] = "0.2"
+        a["library"] = r.library; a["model"] = r.model; a["nvar"] = r.nvar; a["ncon"] = r.ncon
         g = create_group(f, "solution")
         g["solution"] = r.x; g["multipliers"] = r.y; g["multipliers_L"] = r.zl; g["multipliers_U"] = r.zu
-        g["objective"] = r.objective; g["status"] = r.status; g["iterations"] = r.iterations
+        g["objective"] = r.objective; g["minimize"] = Int8(r.minimize); g["status"] = r.status
+        g["solver_status"] = r.solver_status; g["iterations"] = r.iterations
+        isempty(r.blocks) && return
         b = create_group(f, "blocks")
         for (kind, name, fields) in r.blocks
             k = haskey(b, kind) ? b[kind] : create_group(b, kind)
             h = create_group(k, name)
+            attributes(h)["dims"] = collect(Int64, size(last(first(fields))))
             for (field, arr) in fields
                 h[field] = arr
             end

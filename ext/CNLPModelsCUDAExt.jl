@@ -41,7 +41,7 @@ function CNLPModels._device_model(::Val{:cuda}, m::CNLPModel)
     dp === nothing && throw(ArgumentError(
         "`$(m.prefix)` has no device tier: the library does not export `$(sym(:device))` " *
         "(compile it with `compile_library(...; device = :cuda)`)"))
-    space = ccall(dp, Cint, (Cint,), m.id)
+    space = ccall(dp, Int64, (Int64,), m.id)
     space == 1 || throw(ArgumentError("`$(sym(:device))` reports memory space $space, not CUDA (1)"))
     hm = m.meta
     meta = NLPModelMeta(
@@ -68,7 +68,7 @@ function NLPModels.obj(m::CuCNLPModel, x::StridedCuVector{Float64})
     increment!(m, :neval_obj)
     _handoff()
     out = Ref{Cdouble}(0.0)
-    _check(ccall(m.obj_p, Cint, (Cint, Ptr{Cdouble}, Ptr{Cdouble}), m.host.id, _ptr(x), out), :obj_d)
+    _check(ccall(m.obj_p, Int64, (Int64, Ptr{Cdouble}, Ptr{Cdouble}), m.host.id, _ptr(x), out), :obj_d)
     return out[]
 end
 
@@ -76,7 +76,7 @@ function NLPModels.grad!(m::CuCNLPModel, x::StridedCuVector{Float64}, g::Strided
     @lencheck m.meta.nvar x g
     increment!(m, :neval_grad)
     _handoff()
-    _check(ccall(m.grad_p, Cint, (Cint, Ptr{Cdouble}, Ptr{Cdouble}), m.host.id, _ptr(x), _ptr(g)), :grad_d)
+    _check(ccall(m.grad_p, Int64, (Int64, Ptr{Cdouble}, Ptr{Cdouble}), m.host.id, _ptr(x), _ptr(g)), :grad_d)
     return g
 end
 
@@ -87,7 +87,7 @@ for (f, counter) in ((:cons!, :neval_cons), (:cons_nln!, :neval_cons_nln))
         increment!(m, $(QuoteNode(counter)))
         m.meta.ncon == 0 && return c
         _handoff()
-        _check(ccall(m.cons_p, Cint, (Cint, Ptr{Cdouble}, Ptr{Cdouble}), m.host.id, _ptr(x), _ptr(c)), :cons_d)
+        _check(ccall(m.cons_p, Int64, (Int64, Ptr{Cdouble}, Ptr{Cdouble}), m.host.id, _ptr(x), _ptr(c)), :cons_d)
         return c
     end
 end
@@ -98,7 +98,7 @@ function NLPModels.jac_coord!(m::CuCNLPModel, x::StridedCuVector{Float64}, vals:
     increment!(m, :neval_jac)
     m.meta.nnzj == 0 && return vals
     _handoff()
-    _check(ccall(m.jac_p, Cint, (Cint, Ptr{Cdouble}, Ptr{Cdouble}), m.host.id, _ptr(x), _ptr(vals)), :jac_d)
+    _check(ccall(m.jac_p, Int64, (Int64, Ptr{Cdouble}, Ptr{Cdouble}), m.host.id, _ptr(x), _ptr(vals)), :jac_d)
     return vals
 end
 
@@ -113,7 +113,7 @@ function NLPModels.hess_coord!(
     m.meta.nnzh == 0 && return vals
     _handoff()
     yp = m.meta.ncon == 0 ? _ptr(m.zeroy) : _ptr(y)
-    _check(ccall(m.hess_p, Cint, (Cint, Ptr{Cdouble}, Ptr{Cdouble}, Cdouble, Ptr{Cdouble}),
+    _check(ccall(m.hess_p, Int64, (Int64, Ptr{Cdouble}, Ptr{Cdouble}, Cdouble, Ptr{Cdouble}),
                  m.host.id, _ptr(x), yp, Cdouble(obj_weight), _ptr(vals)), :hess_d)
     return vals
 end
