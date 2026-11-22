@@ -1092,8 +1092,11 @@ end
 
 Write a solution with one of the library's writers (see [`writers`](@ref)).
 `result` is a solver result with `solution`, `multipliers`, `multipliers_L`,
-`multipliers_U`, `objective` and `status` (MadNLP's, NLPModelsIpopt's); arrays
-on a device are copied to the host first.
+`multipliers_U`, `objective` and `status` (MadNLP's, NLPModelsIpopt's), in the
+NLPModels sign convention, which is converted to the cnlp one for a maximizing model.
+The explicit form takes `y`, `zl`, `zu` already in the cnlp convention
+(σ∇f + Jᵀy − zL + zU = 0, cnlp-solution 2.1). Arrays on a device are copied to the
+host first.
 """
 function write_solution(m::CNLPModel, writer::Symbol, path::AbstractString,
                         x::AbstractVector, y::AbstractVector, zl::AbstractVector, zu::AbstractVector;
@@ -1103,14 +1106,24 @@ function write_solution(m::CNLPModel, writer::Symbol, path::AbstractString,
     @lencheck m.meta.ncon y
     fp = Libdl.dlsym(m.lib.handle, Symbol(m.prefix, "_write_", writer))
     hx, hy, hl, hu = (Vector{Float64}(Array(v)) for v in (x, y, zl, zu))
-    _check(ccall(fp, Cint, (Cint, Cstring, Ptr{Cdouble}, Ptr{Cdouble}, Ptr{Cdouble}, Ptr{Cdouble}, Cdouble, Cstring),
-                 m.id, path, hx, hy, hl, hu, Cdouble(objective), status), Symbol(m.prefix, "_write_", writer))
+    st = ccall(fp, Cint, (Cint, Cstring, Ptr{Cdouble}, Ptr{Cdouble}, Ptr{Cdouble}, Ptr{Cdouble}, Cdouble, Cstring),
+               m.id, path, hx, hy, hl, hu, Cdouble(objective), status)
+    st == 0 || error("writer `$writer` of `$(m.prefix)` could not write $path (status $st)")
     return path
 end
 
-write_solution(m::CNLPModel, writer::Symbol, path::AbstractString, result) =
-    write_solution(m, writer, path, result.solution, result.multipliers, result.multipliers_L, result.multipliers_U;
-                   objective = result.objective, status = string(result.status))
+function write_solution(m::CNLPModel, writer::Symbol, path::AbstractString, result)
+    y, zl, zu = _to_cnlp_signs(m, result.multipliers, result.multipliers_L, result.multipliers_U)
+    return write_solution(m, writer, path, result.solution, y, zl, zu;
+                          objective = result.objective, status = string(result.status))
+end
+
+# Multiplier signs. A cnlp solution satisfies σ∇f + Jᵀy − zL + zU = 0 (σ = −1 when the model
+# maximizes; cnlp-solution 2.1). NLPModels/SolverCore results (MadNLP, NLPModelsIpopt) satisfy
+# ∇f + Jᵀy − zL + zU = 0, so for a maximizing model all three are negated, each way.
+_to_cnlp_signs(m::CNLPModel, y, zl, zu) =
+    m.meta.minimize ? (y, zl, zu) : (-Array(y), -Array(zl), -Array(zu))
+_from_cnlp_signs(m::CNLPModel, y, zl, zu) = _to_cnlp_signs(m, y, zl, zu)
 
 # ── the standard solution format ────────────────────────────────────────────────
 # Any library gets it, built from its named blocks; a library can name its own
@@ -1125,9 +1138,8 @@ write_solution(m::CNLPModel, writer::Symbol, path::AbstractString, result) =
 # The solution as plain host data, organized by the library's named blocks.
 function _solution_record(m::CNLPModel, result)
     x = Vector{Float64}(Array(result.solution))
-    y = Vector{Float64}(Array(result.multipliers))
-    zl = Vector{Float64}(Array(result.multipliers_L))
-    zu = Vector{Float64}(Array(result.multipliers_U))
+    y, zl, zu = (Vector{Float64}(Array(v)) for v in
+                 _to_cnlp_signs(m, result.multipliers, result.multipliers_L, result.multipliers_U))
     c = m.meta.ncon > 0 ? NLPModels.cons(m, x) : Float64[]
     sl(v, b) = reshape(v[(b.offset + 1):(b.offset + b.length)], b.dims...)
     blocks = Tuple{String,String,Vector{Pair{String,Array{Float64}}}}[]
@@ -1285,8 +1297,10 @@ end
     read_start(m, reader::Symbol, path) -> (; x0, y0, zl, zu)
 
 A starting point read from the model's own file format by one of its start
-readers, as host vectors. Use it to warm-start a solve, e.g.
-`madnlp(m; x0 = s.x0)` or by copying into `m.meta.x0`.
+readers, as host vectors, with the multipliers in the NLPModels sign convention
+(converted from the cnlp one for a maximizing model) so they go straight to an
+NLPModels solver. Use it to warm-start a solve, e.g. `madnlp(m; x0 = s.x0)` or by
+copying into `m.meta.x0`.
 """
 function read_start(m::CNLPModel, reader::Symbol, path::AbstractString)
     _reader_of_kind(m.lib, m.prefix, reader, :start)
@@ -1295,6 +1309,7 @@ function read_start(m::CNLPModel, reader::Symbol, path::AbstractString)
     fp = Libdl.dlsym(m.lib.handle, Symbol(m.prefix, "_start_from_", reader))
     _check(ccall(fp, Cint, (Cint, Cstring, Ptr{Cdouble}, Ptr{Cdouble}, Ptr{Cdouble}, Ptr{Cdouble}),
                  m.id, path, x0, y0, zl, zu), Symbol(m.prefix, "_start_from_", reader))
+    y0, zl, zu = _from_cnlp_signs(m, y0, zl, zu)
     return (; x0, y0, zl, zu)
 end
 
