@@ -7,35 +7,14 @@ Ipopt, ...) can solve it. The main producer of such libraries is ExaModels'
 tape recorder (`compile_library`), but any
 library implementing the ABI below works, in any language.
 
-Implements cnlp ABI v0.1 (normative spec: `cnlp.h` at
-https://github.com/madsuite-org/cnlp-abi, tag v0.1).
+Implements cnlp ABI 0.2 (normative spec: `cnlp.h` at
+https://github.com/madsuite-org/cnlp-abi).
 
-# C ABI convention
-
-For a chosen symbol `prefix` (e.g. `rec`), the library exposes — all indices
-1-based, Hessian as the lower triangle of `obj_weight * ∇²f + Σ yᵢ ∇²cᵢ`,
-every function returning `Int64` status `0` on success:
-
-    <prefix>_new(n::Int64)::Int64                   # instantiate at size n; returns
-                                                  # a positive model id, 0 on failure
-    <prefix>_nvar(id::Int64)::Int64
-    <prefix>_ncon(id::Int64)::Int64
-    <prefix>_nnzj(id::Int64)::Int64
-    <prefix>_nnzh(id::Int64)::Int64
-    <prefix>_meta(id, x0, lvar, uvar, lcon, ucon)::Int64      # Ptr{Cdouble} × 5
-    <prefix>_obj(id, x::Ptr{Cdouble}, out::Ptr{Cdouble})::Int64
-    <prefix>_grad(id, x::Ptr{Cdouble}, g::Ptr{Cdouble})::Int64
-    <prefix>_cons(id, x::Ptr{Cdouble}, c::Ptr{Cdouble})::Int64
-    <prefix>_jac_structure(id, rows::Ptr{Int64}, cols::Ptr{Int64})::Int64
-    <prefix>_jac(id, x::Ptr{Cdouble}, vals::Ptr{Cdouble})::Int64
-    <prefix>_hess_structure(id, rows::Ptr{Int64}, cols::Ptr{Int64})::Int64
-    <prefix>_hess(id, x::Ptr{Cdouble}, y::Ptr{Cdouble}, obj_weight::Cdouble,
-                  vals::Ptr{Cdouble})::Int64
-
-Handles make models independent: any number of `CNLPModel`s may coexist per
-library (each `<prefix>_new` call creates one; models live for the process
-lifetime). A library may also carry *several models*, one prefix each — name
-the one you want as a symbol, `CNLPModel("@grid", :acopf, ...)`.
+A model is a `CNLPModel{VT}`: `VT = Vector{Float64}` evaluates through the library's
+host callbacks; with `device = :cuda` (CUDA extension) `VT` is a `CuVector` and the
+same instance evaluates through the device tier (`P_*_d`) on device pointers. Any
+number of instances may coexist per library, and a library may carry several models,
+one prefix each: `CNLPModel("@grid", :acopf, ...)`.
 
 # The libblastrampoline seam
 
@@ -188,29 +167,41 @@ function restore_blas!(lib::CLib)
     return lib
 end
 
-struct CNLPModel <: AbstractNLPModel{Float64, Vector{Float64}}
-    meta::NLPModelMeta{Float64, Vector{Float64}}
+"""
+    CNLPModel{VT}
+
+A model instance of a cnlp library as an `AbstractNLPModel{Float64, VT}`. `VT` is where
+the solver's vectors live: `Vector{Float64}` on the host, a GPU vector type for a model
+built with `device = ...` (the evaluation pointers are then the library's device tier).
+Structure, layout, parameters, readers and writers are instance state and work the same
+for every `VT`.
+"""
+struct CNLPModel{VT <: AbstractVector{Float64}, IT <: AbstractVector{Int}} <: AbstractNLPModel{Float64, VT}
+    meta::NLPModelMeta{Float64, VT}
     counters::Counters
     lib::CLib
     id::Int64
+    # evaluation: the host callbacks, or the device tier (`P_*_d`)
     obj_p::Ptr{Cvoid}
     grad_p::Ptr{Cvoid}
     cons_p::Ptr{Cvoid}
-    jac_structure_p::Ptr{Cvoid}
     jac_p::Ptr{Cvoid}
-    hess_structure_p::Ptr{Cvoid}
     hess_p::Ptr{Cvoid}
-    # cached Jacobian structure + a value buffer, for jprod!/jtprod!
+    # the sparsity structures, read once on the host
     jrows::Vector{Int}
     jcols::Vector{Int}
-    jbuf::Vector{Float64}
-    # cached Hessian structure + a value buffer, for hprod!
     hrows::Vector{Int}
     hcols::Vector{Int}
-    hbuf::Vector{Float64}
-    # the model's NAMED blocks, read from the library at construction, and the
-    # prefix they are addressed under (parameters are read and written through
-    # it after the fact)
+    # the same structures where VT lives, value buffers for the products, and the
+    # zero multipliers of the objective-only Hessian
+    vjrows::IT
+    vjcols::IT
+    vhrows::IT
+    vhcols::IT
+    jbuf::VT
+    hbuf::VT
+    zeroy::VT
+    # the model's named blocks and the prefix they are addressed under
     prefix::String
     vars::NamedTuple
     cons::NamedTuple
@@ -552,18 +543,15 @@ function CNLPModel(
         minimize = minimize, name = String(name),
     )
     vars, cons, pars = _read_layout(lib, prefix, id)
+    jrows, jcols = _structure(fp(:jac_structure), id, nnzj, sym(:jac_structure))
+    hrows, hcols = _structure(fp(:hess_structure), id, nnzh, sym(:hess_structure))
     m = CNLPModel(
         meta, Counters(), lib, id,
-        fp(:obj), fp(:grad), fp(:cons),
-        fp(:jac_structure), fp(:jac), fp(:hess_structure), fp(:hess),
-        Vector{Int}(undef, nnzj), Vector{Int}(undef, nnzj),
-        Vector{Float64}(undef, nnzj),
-        Vector{Int}(undef, nnzh), Vector{Int}(undef, nnzh),
-        Vector{Float64}(undef, nnzh),
+        fp(:obj), fp(:grad), fp(:cons), fp(:jac), fp(:hess),
+        jrows, jcols, hrows, hcols, jrows, jcols, hrows, hcols,
+        Vector{Float64}(undef, nnzj), Vector{Float64}(undef, nnzh), zeros(ncon),
         String(prefix), vars, cons, pars,
     )
-    NLPModels.jac_structure!(m, m.jrows, m.jcols)
-    NLPModels.hess_structure!(m, m.hrows, m.hcols)
     # Restore once more on the way out: the structure calls above are the
     # first entries into THIS model's generated code, and in a multi-model
     # library a later model's first calls can lazily clobber the trampoline
@@ -574,7 +562,7 @@ function CNLPModel(
     device === :cpu && return m
     # The device tier (`P_device`, `P_*_d`): a model on the same instance whose
     # metadata and buffers live on the device. Provided by a package extension.
-    hasmethod(_device_model, Tuple{Val{device}, CNLPModel}) || throw(ArgumentError(
+    hasmethod(_device_model, Tuple{Val{device}, typeof(m)}) || throw(ArgumentError(
         "`device = :$device` needs its extension loaded (for :cuda, `using CUDA` or `using CUDACore`)"))
     return _device_model(Val(device), m)
 end
@@ -582,9 +570,17 @@ end
 """
     _device_model(::Val{device}, m::CNLPModel)
 
-The device-resident model for host model `m`. Methods live in package extensions.
+The same instance as `m` with `VT` on `device`, evaluated through the device tier.
+Methods live in package extensions.
 """
 function _device_model end
+
+# A sparsity structure (1-based COO), read from the library.
+function _structure(fp::Ptr{Cvoid}, id::Int64, nnz::Int, name::Symbol)
+    r = Vector{Int}(undef, nnz); c = Vector{Int}(undef, nnz)
+    _check(ccall(fp, Int64, (Int64, Ptr{Int64}, Ptr{Int64}), id, r, c), name)
+    return r, c
+end
 
 """
     CNLPModel(spec::AbstractString, arg1, arg2, ...; kwargs...)
@@ -910,37 +906,54 @@ function set_value!(m::CNLPModel, b::BlockRef, values)
     return m
 end
 
+# ── evaluation, for every VT ──────────────────────────────────────────────────────
+# Two hooks are specialized per storage by the extensions: `_ptr`, an array as the raw
+# pointer the ABI takes (a host array converts itself in `ccall`), and `_sync`, which
+# orders the library's reads after our writes (a no-op on the host). The products
+# assemble from the COO values the ABI provides through `_coo_mul!` and `_sym_mul!`.
+
+_ptr(a::AbstractVector{Float64}) = a
+_sync(::CNLPModel) = nothing
+
 function NLPModels.obj(m::CNLPModel, x::AbstractVector{Float64})
     @lencheck m.meta.nvar x
     increment!(m, :neval_obj)
+    _sync(m)
     out = Ref{Cdouble}(0.0)
-    _check(ccall(m.obj_p, Int64, (Int64, Ptr{Cdouble}, Ptr{Cdouble}), m.id, x, out), :obj)
+    _check(ccall(m.obj_p, Int64, (Int64, Ptr{Cdouble}, Ptr{Cdouble}), m.id, _ptr(x), out), :obj)
     return out[]
 end
 
 function NLPModels.grad!(m::CNLPModel, x::AbstractVector{Float64}, g::AbstractVector{Float64})
     @lencheck m.meta.nvar x g
     increment!(m, :neval_grad)
-    _check(ccall(m.grad_p, Int64, (Int64, Ptr{Cdouble}, Ptr{Cdouble}), m.id, x, g), :grad)
+    _sync(m)
+    _check(ccall(m.grad_p, Int64, (Int64, Ptr{Cdouble}, Ptr{Cdouble}), m.id, _ptr(x), _ptr(g)), :grad)
     return g
 end
 
-function NLPModels.cons!(m::CNLPModel, x::AbstractVector{Float64}, c::AbstractVector{Float64})
-    @lencheck m.meta.nvar x
-    @lencheck m.meta.ncon c
-    increment!(m, :neval_cons)
-    _check(ccall(m.cons_p, Int64, (Int64, Ptr{Cdouble}, Ptr{Cdouble}), m.id, x, c), :cons)
-    return c
+# The ABI draws no linear/nonlinear distinction: all constraints are nonlinear.
+for (fn, inc) in ((:cons!, :neval_cons), (:cons_nln!, :neval_cons_nln))
+    @eval function NLPModels.$fn(m::CNLPModel, x::AbstractVector{Float64}, c::AbstractVector{Float64})
+        @lencheck m.meta.nvar x
+        @lencheck m.meta.ncon c
+        increment!(m, $(QuoteNode(inc)))
+        m.meta.ncon == 0 && return c
+        _sync(m)
+        _check(ccall(m.cons_p, Int64, (Int64, Ptr{Cdouble}, Ptr{Cdouble}), m.id, _ptr(x), _ptr(c)), :cons)
+        return c
+    end
 end
 
-function NLPModels.jac_structure!(
-    m::CNLPModel, rows::AbstractVector{<:Integer}, cols::AbstractVector{<:Integer},
-)
+function NLPModels.jac_structure!(m::CNLPModel, rows::AbstractVector{<:Integer}, cols::AbstractVector{<:Integer})
     @lencheck m.meta.nnzj rows cols
-    r = Vector{Int64}(undef, m.meta.nnzj)
-    c = Vector{Int64}(undef, m.meta.nnzj)
-    _check(ccall(m.jac_structure_p, Int64, (Int64, Ptr{Int64}, Ptr{Int64}), m.id, r, c), :jac_structure)
-    copyto!(rows, r); copyto!(cols, c)
+    copyto!(rows, m.jrows); copyto!(cols, m.jcols)
+    return rows, cols
+end
+
+function NLPModels.hess_structure!(m::CNLPModel, rows::AbstractVector{<:Integer}, cols::AbstractVector{<:Integer})
+    @lencheck m.meta.nnzh rows cols
+    copyto!(rows, m.hrows); copyto!(cols, m.hcols)
     return rows, cols
 end
 
@@ -948,53 +961,10 @@ function NLPModels.jac_coord!(m::CNLPModel, x::AbstractVector{Float64}, vals::Ab
     @lencheck m.meta.nvar x
     @lencheck m.meta.nnzj vals
     increment!(m, :neval_jac)
-    _check(ccall(m.jac_p, Int64, (Int64, Ptr{Cdouble}, Ptr{Cdouble}), m.id, x, vals), :jac)
+    m.meta.nnzj == 0 && return vals
+    _sync(m)
+    _check(ccall(m.jac_p, Int64, (Int64, Ptr{Cdouble}, Ptr{Cdouble}), m.id, _ptr(x), _ptr(vals)), :jac)
     return vals
-end
-
-function NLPModels.hess_structure!(
-    m::CNLPModel, rows::AbstractVector{<:Integer}, cols::AbstractVector{<:Integer},
-)
-    @lencheck m.meta.nnzh rows cols
-    r = Vector{Int64}(undef, m.meta.nnzh)
-    c = Vector{Int64}(undef, m.meta.nnzh)
-    _check(ccall(m.hess_structure_p, Int64, (Int64, Ptr{Int64}, Ptr{Int64}), m.id, r, c), :hess_structure)
-    copyto!(rows, r); copyto!(cols, c)
-    return rows, cols
-end
-
-for (fn, inc) in ((:jprod_nln!, :neval_jprod), (:jprod!, :neval_jprod))
-    @eval function NLPModels.$fn(
-        m::CNLPModel, x::AbstractVector{Float64}, v::AbstractVector{Float64},
-        Jv::AbstractVector{Float64},
-    )
-        @lencheck m.meta.nvar x v
-        @lencheck m.meta.ncon Jv
-        increment!(m, $(QuoteNode(inc)))
-        NLPModels.jac_coord!(m, x, m.jbuf)
-        fill!(Jv, 0.0)
-        @inbounds for k in eachindex(m.jbuf)
-            Jv[m.jrows[k]] += m.jbuf[k] * v[m.jcols[k]]
-        end
-        return Jv
-    end
-end
-
-for (fn, inc) in ((:jtprod_nln!, :neval_jtprod), (:jtprod!, :neval_jtprod))
-    @eval function NLPModels.$fn(
-        m::CNLPModel, x::AbstractVector{Float64}, v::AbstractVector{Float64},
-        Jtv::AbstractVector{Float64},
-    )
-        @lencheck m.meta.nvar x Jtv
-        @lencheck m.meta.ncon v
-        increment!(m, $(QuoteNode(inc)))
-        NLPModels.jac_coord!(m, x, m.jbuf)
-        fill!(Jtv, 0.0)
-        @inbounds for k in eachindex(m.jbuf)
-            Jtv[m.jcols[k]] += m.jbuf[k] * v[m.jrows[k]]
-        end
-        return Jtv
-    end
 end
 
 function NLPModels.hess_coord!(
@@ -1005,64 +975,71 @@ function NLPModels.hess_coord!(
     @lencheck m.meta.ncon y
     @lencheck m.meta.nnzh vals
     increment!(m, :neval_hess)
-    _check(ccall(m.hess_p, Int64,
-        (Int64, Ptr{Cdouble}, Ptr{Cdouble}, Cdouble, Ptr{Cdouble}),
-        m.id, x, y, Cdouble(obj_weight), vals), :hess)
+    m.meta.nnzh == 0 && return vals
+    _sync(m)
+    _check(ccall(m.hess_p, Int64, (Int64, Ptr{Cdouble}, Ptr{Cdouble}, Cdouble, Ptr{Cdouble}),
+                 m.id, _ptr(x), _ptr(y), Cdouble(obj_weight), _ptr(vals)), :hess)
     return vals
 end
 
-function NLPModels.hess_coord!(
-    m::CNLPModel, x::AbstractVector{Float64}, vals::AbstractVector{Float64};
-    obj_weight::Real = 1.0,
-)
-    return NLPModels.hess_coord!(m, x, zeros(m.meta.ncon), vals; obj_weight = obj_weight)
+NLPModels.hess_coord!(m::CNLPModel, x::AbstractVector{Float64}, vals::AbstractVector{Float64};
+                      obj_weight::Real = 1.0) =
+    NLPModels.hess_coord!(m, x, m.zeroy, vals; obj_weight)
+
+# y = A v for COO (rows, cols, vals), and for a lower triangle stored as COO.
+function _coo_mul!(y, rows, cols, vals, v)
+    fill!(y, 0.0)
+    @inbounds for k in eachindex(vals)
+        y[rows[k]] += vals[k] * v[cols[k]]
+    end
+    return y
+end
+function _sym_mul!(y, rows, cols, vals, v)
+    fill!(y, 0.0)
+    @inbounds for k in eachindex(vals)
+        i, j, h = rows[k], cols[k], vals[k]
+        y[i] += h * v[j]
+        i == j || (y[j] += h * v[i])
+    end
+    return y
 end
 
-# All constraints are nonlinear here — the ABI draws no linear/nonlinear
-# distinction — so the _nln spellings some solver code paths call are the
-# plain ones.
-function NLPModels.cons_nln!(
-    m::CNLPModel, x::AbstractVector{Float64}, c::AbstractVector{Float64},
-)
-    @lencheck m.meta.nvar x
-    @lencheck m.meta.ncon c
-    increment!(m, :neval_cons_nln)
-    _check(ccall(m.cons_p, Int64, (Int64, Ptr{Cdouble}, Ptr{Cdouble}), m.id, x, c), :cons)
-    return c
+for (fn, inc) in ((:jprod_nln!, :neval_jprod), (:jprod!, :neval_jprod))
+    @eval function NLPModels.$fn(m::CNLPModel, x::AbstractVector{Float64}, v::AbstractVector{Float64},
+                                 Jv::AbstractVector{Float64})
+        @lencheck m.meta.nvar x v
+        @lencheck m.meta.ncon Jv
+        increment!(m, $(QuoteNode(inc)))
+        NLPModels.jac_coord!(m, x, m.jbuf)
+        return _coo_mul!(Jv, m.vjrows, m.vjcols, m.jbuf, v)
+    end
 end
 
-# Hessian-vector product, assembled from the COO Hessian the ABI provides:
-# one `P_hess` evaluation into the cached buffer, then a symmetric matvec
-# over the lower triangle (off-diagonal entries contribute both ways). This
-# is what lets matrix-free solvers run against a compiled model at all; a
-# library wanting true matrix-free products is a future ABI addition, and
-# this stays the fallback for libraries without one.
+for (fn, inc) in ((:jtprod_nln!, :neval_jtprod), (:jtprod!, :neval_jtprod))
+    @eval function NLPModels.$fn(m::CNLPModel, x::AbstractVector{Float64}, v::AbstractVector{Float64},
+                                 Jtv::AbstractVector{Float64})
+        @lencheck m.meta.nvar x Jtv
+        @lencheck m.meta.ncon v
+        increment!(m, $(QuoteNode(inc)))
+        NLPModels.jac_coord!(m, x, m.jbuf)
+        return _coo_mul!(Jtv, m.vjcols, m.vjrows, m.jbuf, v)
+    end
+end
+
 function NLPModels.hprod!(
     m::CNLPModel, x::AbstractVector{Float64}, y::AbstractVector{Float64},
-    v::AbstractVector{Float64}, Hv::AbstractVector{Float64};
-    obj_weight::Real = 1.0,
+    v::AbstractVector{Float64}, Hv::AbstractVector{Float64}; obj_weight::Real = 1.0,
 )
     @lencheck m.meta.nvar x v Hv
     @lencheck m.meta.ncon y
     increment!(m, :neval_hprod)
-    _check(ccall(m.hess_p, Int64,
-        (Int64, Ptr{Cdouble}, Ptr{Cdouble}, Cdouble, Ptr{Cdouble}),
-        m.id, x, y, Cdouble(obj_weight), m.hbuf), :hess)
-    fill!(Hv, 0.0)
-    @inbounds for k in eachindex(m.hbuf)
-        i, j, h = m.hrows[k], m.hcols[k], m.hbuf[k]
-        Hv[i] += h * v[j]
-        i == j || (Hv[j] += h * v[i])
-    end
-    return Hv
+    NLPModels.hess_coord!(m, x, y, m.hbuf; obj_weight)
+    return _sym_mul!(Hv, m.vhrows, m.vhcols, m.hbuf, v)
 end
 
-function NLPModels.hprod!(
-    m::CNLPModel, x::AbstractVector{Float64}, v::AbstractVector{Float64},
-    Hv::AbstractVector{Float64}; obj_weight::Real = 1.0,
-)
-    return NLPModels.hprod!(m, x, zeros(m.meta.ncon), v, Hv; obj_weight = obj_weight)
-end
+NLPModels.hprod!(m::CNLPModel, x::AbstractVector{Float64}, v::AbstractVector{Float64},
+                 Hv::AbstractVector{Float64}; obj_weight::Real = 1.0) =
+    NLPModels.hprod!(m, x, m.zeroy, v, Hv; obj_weight)
 
 # ── solution writers ─────────────────────────────────────────────────────────────
 # A library may carry writers for its models (P_nwriters, P_writer_name,
@@ -1142,12 +1119,21 @@ const _STATUS = Dict(
 )
 _status(s) = get(_STATUS, string(s), "error")
 
+# c(x) through the host callback, whatever VT the model evaluates on.
+function _host_cons(m::CNLPModel, x::Vector{Float64})
+    c = zeros(m.meta.ncon)
+    m.meta.ncon == 0 && return c
+    fp = Libdl.dlsym(m.lib.handle, Symbol(m.prefix, "_cons"))
+    _check(ccall(fp, Int64, (Int64, Ptr{Cdouble}, Ptr{Cdouble}), m.id, x, c), Symbol(m.prefix, "_cons"))
+    return c
+end
+
 # The solution as plain host data, organized by the library's named blocks.
 function _solution_record(m::CNLPModel, result)
     x = Vector{Float64}(Array(result.solution))
     y, zl, zu = (Vector{Float64}(Array(v)) for v in
                  _to_cnlp_signs(m, result.multipliers, result.multipliers_L, result.multipliers_U))
-    c = m.meta.ncon > 0 ? NLPModels.cons(m, x) : Float64[]
+    c = _host_cons(m, x)
     sl(v, b) = reshape(v[(b.offset + 1):(b.offset + b.length)], b.dims...)
     blocks = Tuple{String,String,Vector{Pair{String,Array{Float64}}}}[]
     for (name, b) in pairs(get_vars(m))

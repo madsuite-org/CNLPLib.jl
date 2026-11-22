@@ -18,6 +18,13 @@ run(`$cc -shared -fPIC -O2 -o $LIBPATH $(joinpath(FIXDIR, "tinyqp.c"))`)
         @test_throws ErrorException CNLPModel(lib, 1; prefix = "tq")
     end
 
+    @testset "storage type" begin
+        m = CNLPModel(lib, 4; prefix = "tq")
+        @test m isa CNLPModel{Vector{Float64}} && m isa AbstractNLPModel{Float64, Vector{Float64}}
+        # a device model needs its extension (and a library with the device tier)
+        @test_throws ArgumentError CNLPModel(lib, 4; prefix = "tq", device = :cuda)
+    end
+
     m = CNLPModel(lib, 4; prefix = "tq")
 
     @testset "meta" begin
