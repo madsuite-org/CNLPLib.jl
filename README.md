@@ -1,10 +1,10 @@
-# CNLPModels.jl
+# CNLPLib.jl
 
-[![CI](https://github.com/madsuite-org/CNLPModels.jl/actions/workflows/ci.yml/badge.svg)](https://github.com/madsuite-org/CNLPModels.jl/actions/workflows/ci.yml)
-[![codecov](https://codecov.io/gh/madsuite-org/CNLPModels.jl/branch/master/graph/badge.svg)](https://codecov.io/gh/madsuite-org/CNLPModels.jl)
+[![CI](https://github.com/madsuite-org/CNLPLib.jl/actions/workflows/ci.yml/badge.svg)](https://github.com/madsuite-org/CNLPLib.jl/actions/workflows/ci.yml)
+[![codecov](https://codecov.io/gh/madsuite-org/CNLPLib.jl/branch/master/graph/badge.svg)](https://codecov.io/gh/madsuite-org/CNLPLib.jl)
 
 Load a nonlinear program (NLP) exposed by a **shared library through a plain
-C interface** and use it as an `NLPModels.AbstractNLPModel` — so any
+C interface** (the [cnlp ABI](https://github.com/madsuite-org/cnlp-abi)) and use it as an `NLPModels.AbstractNLPModel` — so any
 NLPModels-compatible solver (Ipopt via NLPModelsIpopt, or any other) can
 solve it in Julia.
 
@@ -13,9 +13,9 @@ Any library implementing the [cnlp ABI](https://github.com/madsuite-org/cnlp-abi
 implementation in ~100 lines of plain C.
 
 ```julia
-using CNLPModels, NLPModelsIpopt
+using CNLPLib, NLPModelsIpopt
 
-CNLPModels.set_path!("/opt/models")        # or the CNLPMODELS_PATH env variable
+CNLPLib.set_path!("/opt/models")        # or the CNLPLIB_PATH env variable
 
 m = CNLPModel("@mymodel", 1000)            # resolves libmymodel.so, instance of size 1000
 # m = CNLPModel("/path/to/mymodel", 1000)  # or a literal path: library file or bundle dir
@@ -30,7 +30,7 @@ handle, directly usable as the library argument:
 m = CNLPModel(cnlp"mymodel", 1000)
 ```
 
-(Or bypass the path entirely with `CNLPModels.load("/path/libmymodel.so")`.)
+(Or bypass the path entirely with `CNLPLib.load("/path/libmymodel.so")`.)
 Any number of model instances may coexist per library.
 
 ### Several models in one library

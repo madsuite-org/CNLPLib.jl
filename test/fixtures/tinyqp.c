@@ -1,5 +1,5 @@
 /*
- * Minimal reference implementation of the CNLPModels C ABI, in plain C —
+ * Minimal reference implementation of the CNLPLib C ABI, in plain C —
  * both a hermetic test fixture and documentation-by-example that the ABI is
  * language-neutral.
  *

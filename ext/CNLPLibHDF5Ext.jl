@@ -2,11 +2,11 @@
 The standard solution format, cnlp-solution 0.2 (formats/solution.md of cnlp-abi): root
 attributes, the `/solution` group ExaModelsIO also uses, and `/blocks/<kind>/<name>`.
 """
-module CNLPModelsHDF5Ext
+module CNLPLibHDF5Ext
 
-using CNLPModels, HDF5
+using CNLPLib, HDF5
 
-function CNLPModels._write_standard(path::AbstractString, r)
+function CNLPLib._write_standard(path::AbstractString, r)
     h5open(path, "w") do f
         a = attributes(f)
         a["format"] = "cnlp-solution"; a["format_version"] = "0.2"
