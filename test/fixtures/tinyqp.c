@@ -1,5 +1,5 @@
 /*
- * Minimal reference implementation of the CNLPModels C ABI, in plain C —
+ * Minimal reference implementation of the CNLPLib C ABI, in plain C —
  * both a hermetic test fixture and documentation-by-example that the ABI is
  * language-neutral.
  *
@@ -14,7 +14,7 @@
 
 /* ── cnlp v0.2 conformance ─────────────────────────────────────────────────
  * The spec header is vendored beside this file (byte-identical to cnlp.h at
- * the cnlp-abi v0.2 release); expanding the declarations makes any signature
+ * cnlplib's cnlp.h, ABI 0.2); expanding the declarations makes any signature
  * drift between this fixture and the spec a COMPILE error in the suites.
  * sq and tb are builder-only by design (no P_new), so only their builder
  * tier is macro-checked; the partial prefixes (bf, ns, nf, zz) exercise

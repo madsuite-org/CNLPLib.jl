@@ -1,5 +1,5 @@
 using Test
-using CNLPModels, HDF5
+using CNLPLib, HDF5
 using NLPModels
 using LinearAlgebra
 using MadNLP
@@ -11,8 +11,8 @@ cc = something(Sys.which("cc"), Sys.which("gcc"), Sys.which("clang"))
 @test cc !== nothing
 run(`$cc -shared -fPIC -O2 -o $LIBPATH $(joinpath(FIXDIR, "tinyqp.c"))`)
 
-@testset "CNLPModels" begin
-    lib = CNLPModels.load(LIBPATH)
+@testset "CNLPLib" begin
+    lib = CNLPLib.load(LIBPATH)
 
     @testset "init failure surfaces" begin
         @test_throws ErrorException CNLPModel(lib, 1; prefix = "tq")
@@ -94,21 +94,21 @@ end
     # a second copy under a models dir, named like a registered model
     mdir = mktempdir()
     cp(LIBPATH, joinpath(mdir, "libtoyqp.so"))
-    CNLPModels.set_path!(mdir)
-    l = CNLPModels.lib("toyqp")
-    @test l isa CNLPModels.CLib
-    @test CNLPModels.lib("toyqp") === l          # cached by name
+    CNLPLib.set_path!(mdir)
+    l = CNLPLib.lib("toyqp")
+    @test l isa CNLPLib.CLib
+    @test CNLPLib.lib("toyqp") === l          # cached by name
     m = CNLPModel("@toyqp", 4; prefix = "tq") # name-based construction
     @test m.meta.nvar == 4
     @test cnlp"toyqp" === l                      # the string-literal shortcut
-    @test_throws ErrorException CNLPModels.lib("nonexistent")
+    @test_throws ErrorException CNLPLib.lib("nonexistent")
 end
 
 @testset "arguments are positional, one per schema field" begin
-    lib = CNLPModels.load(LIBPATH)
+    lib = CNLPLib.load(LIBPATH)
     # `tq` declares one scalar field and also exports tq_new, so a lone integer
     # takes the one-knob constructor.
-    @test CNLPModels._schema_field_names(CNLPModels.schema_json(lib; prefix = "tq")) == ["n"]
+    @test CNLPLib._schema_field_names(CNLPLib.schema_json(lib; prefix = "tq")) == ["n"]
     m5 = CNLPModel(lib, 5; prefix = "tq")
     @test m5.meta.nvar == 5
     r5 = madnlp(m5; print_level = MadNLP.ERROR)
@@ -117,7 +117,7 @@ end
 
     # `sq` is builder-only (no sq_new) and declares three fields, so the
     # arguments bind positionally in the order the schema publishes them.
-    @test CNLPModels._schema_field_names(CNLPModels.schema_json(lib; prefix = "sq")) ==
+    @test CNLPLib._schema_field_names(CNLPLib.schema_json(lib; prefix = "sq")) ==
           ["n", "s", "w"]
     n, s, w = 4, 2.0, [1.0, 2.0, 3.0, 4.0]
     ms = CNLPModel(lib, n, s, w; prefix = "sq")
@@ -146,7 +146,7 @@ end
 end
 
 @testset "several models in one library, selected by name" begin
-    lib = CNLPModels.load(LIBPATH)
+    lib = CNLPLib.load(LIBPATH)
     x = [0.5, 0.25, 2.0, -1.0]
     n, s, w = 4, 2.0, [1.0, 2.0, 3.0, 4.0]
 
@@ -184,9 +184,9 @@ end
     @test CNLPModel(lib, :tq, 4; name = "mine").meta.name == "mine"
 
     # Schemas are per model, addressed the same way.
-    @test CNLPModels._schema_field_names(CNLPModels.schema_json(lib, :sq)) ==
+    @test CNLPLib._schema_field_names(CNLPLib.schema_json(lib, :sq)) ==
           ["n", "s", "w"]
-    @test CNLPModels._schema_field_names(CNLPModels.schema_json(lib, :tq)) == ["n"]
+    @test CNLPLib._schema_field_names(CNLPLib.schema_json(lib, :tq)) == ["n"]
 
     # A name the library does not carry is reported as such, at the name —
     # not several calls later as a missing builder surface.
@@ -198,14 +198,14 @@ end
 end
 
 @testset "cnlp literal is the shortcut" begin
-    @test cnlp"toyqp" === CNLPModels.lib("toyqp")
+    @test cnlp"toyqp" === CNLPLib.lib("toyqp")
     m = CNLPModel(cnlp"toyqp", 5; prefix = "tq")   # directly as the lib argument
     @test m.meta.nvar == 5
     @test_throws ErrorException cnlp"nonexistent"
 end
 
 @testset "a fixed library needs no arguments" begin
-    lib = CNLPModels.load(LIBPATH)
+    lib = CNLPLib.load(LIBPATH)
     # `fx` declares zero instantiation arguments (fx_nargs() == 0), so no
     # arguments instantiate it directly through fx_new — whose integer is
     # part of the C signature and ignored.
@@ -220,18 +220,18 @@ end
 
 @testset "a string is @name on the search path, or a literal path" begin
     # `@name` resolves on the search path and defaults the prefix to the name.
-    @test CNLPModels._is_name("@toyqp")
-    @test CNLPModels._default_prefix("@toyqp") == "toyqp"
+    @test CNLPLib._is_name("@toyqp")
+    @test CNLPLib._default_prefix("@toyqp") == "toyqp"
 
     # Anything else is a filesystem path, exactly as written. A full path to
     # the library file, with the prefix defaulting from the file name
     # (libtinyqp.so → tinyqp), overridable as always:
-    @test !CNLPModels._is_name(LIBPATH)
-    @test CNLPModels._default_prefix(LIBPATH) == "tinyqp"
+    @test !CNLPLib._is_name(LIBPATH)
+    @test CNLPLib._default_prefix(LIBPATH) == "tinyqp"
     mp = CNLPModel(LIBPATH, 4; prefix = "tq")
     @test mp.meta.nvar == 4
     # The handle is cached by absolute path: one dlopen per library.
-    @test CNLPModels._resolve_spec(LIBPATH) === CNLPModels._resolve_spec(LIBPATH)
+    @test CNLPLib._resolve_spec(LIBPATH) === CNLPLib._resolve_spec(LIBPATH)
     # A fixed model by path needs nothing beyond the path.
     mf = CNLPModel(LIBPATH; prefix = "fx")
     @test mf.meta.nvar == 3
@@ -241,7 +241,7 @@ end
     bdir = mktempdir()
     mkpath(joinpath(bdir, "toyqp2", "lib"))
     cp(LIBPATH, joinpath(bdir, "toyqp2", "lib", "libtoyqp2.so"))
-    @test CNLPModels._default_prefix(joinpath(bdir, "toyqp2")) == "toyqp2"
+    @test CNLPLib._default_prefix(joinpath(bdir, "toyqp2")) == "toyqp2"
     md = CNLPModel(joinpath(bdir, "toyqp2"), 4; prefix = "tq")
     @test md.meta.nvar == 4
 
@@ -261,12 +261,12 @@ end
 end
 
 @testset "search path initializes from the environment" begin
-    old = copy(CNLPModels._PATHS)
-    withenv("CNLPMODELS_PATH" => "/a:/b") do
-        empty!(CNLPModels._PATHS)
-        @test CNLPModels._paths() == ["/a", "/b"]
+    old = copy(CNLPLib._PATHS)
+    withenv("CNLPLIB_PATH" => "/a:/b") do
+        empty!(CNLPLib._PATHS)
+        @test CNLPLib._paths() == ["/a", "/b"]
     end
-    CNLPModels.set_path!(old...)
+    CNLPLib.set_path!(old...)
 end
 
 @testset "a directory without a library says what it tried" begin
@@ -274,7 +274,7 @@ end
 end
 
 @testset "a table field binds column by column" begin
-    lib = CNLPModels.load(LIBPATH)
+    lib = CNLPLib.load(LIBPATH)
     # min Σ_j w_j (x_{i_j} - 1)^2 over 3 vars: variable 1 carries rows 1 and 4.
     pts = [(i = 1, w = 1.0), (i = 2, w = 2.0), (i = 3, w = 3.0), (i = 1, w = 0.5)]
     m = CNLPModel(lib, pts; prefix = "tb")
@@ -292,7 +292,7 @@ end
 end
 
 @testset "integer weights widen through the i64 array setter" begin
-    lib = CNLPModels.load(LIBPATH)
+    lib = CNLPLib.load(LIBPATH)
     m = CNLPModel(lib, 4, 2.0, [1, 2, 3, 4]; prefix = "sq")
     x = [0.5, 0.25, 2.0, -1.0]
     @test obj(m, x) == sum([1.0, 2.0, 3.0, 4.0] .* (x .- 2.0) .^ 2)
@@ -301,7 +301,7 @@ end
 end
 
 @testset "jprod and jtprod go through the cached structure" begin
-    lib = CNLPModels.load(LIBPATH)
+    lib = CNLPLib.load(LIBPATH)
     m = CNLPModel(lib, 4; prefix = "tq")
     x = [0.5, 0.25, 2.0, -1.0]
     v = [1.0, 2.0, 3.0, 4.0]
@@ -321,10 +321,10 @@ end
 @testset "unbundled juliac libraries are detected by their libjulia NEEDED" begin
     # A plain C library links no libjulia: it must take the ordinary dlopen
     # path (the whole suite above ran through it).
-    @test CNLPModels._stdlinked_libjulia(LIBPATH) === nothing
+    @test CNLPLib._stdlinked_libjulia(LIBPATH) === nothing
     # Unreadable / not-an-object paths are left for dlopen to complain about.
-    @test CNLPModels._stdlinked_libjulia("/nonexistent/libfoo.so") === nothing
-    @test CNLPModels._stdlinked_libjulia(joinpath(FIXDIR, "tinyqp.c")) === nothing
+    @test CNLPLib._stdlinked_libjulia("/nonexistent/libfoo.so") === nothing
+    @test CNLPLib._stdlinked_libjulia(joinpath(FIXDIR, "tinyqp.c")) === nothing
 
     # A library that links the standard libjulia soname is detected, with its
     # version — the trigger for the private-runtime route. Built here by
@@ -338,12 +338,12 @@ end
         linked = joinpath(mktempdir(), "libtinyqp_jl.so")
         run(`$cc -shared -fPIC -O2 -o $linked $(joinpath(FIXDIR, "tinyqp.c"))
              -Wl,--no-as-needed $libjulia`)
-        @test CNLPModels._stdlinked_libjulia(linked) == ver
+        @test CNLPLib._stdlinked_libjulia(linked) == ver
     end
 end
 
 @testset "named blocks" begin
-    lib = CNLPModels.load(LIBPATH)
+    lib = CNLPLib.load(LIBPATH)
     # The fixture publishes a layout: `x` (variable), `budget` (constraint),
     # `w` (parameter). A consumer handed only the library learns the names the
     # model was written with, and addresses slices by them.
@@ -398,7 +398,7 @@ end
 end
 
 @testset "discoverability" begin
-    lib = CNLPModels.load(LIBPATH)
+    lib = CNLPLib.load(LIBPATH)
     # The catalogue answers the one question a caller with only a path has.
     @test available_models(lib) == [:tq, :sq, :fx, :tb, :ps]
     # Argument signatures (cnlp v0.1): every complete model publishes what
@@ -417,7 +417,7 @@ end
 end
 
 @testset "string instantiation" begin
-    lib = CNLPModels.load(LIBPATH)
+    lib = CNLPLib.load(LIBPATH)
     # A lone string argument routes to `<prefix>_new_str` — the entry point
     # `argtype` announces with a lone "string" — exactly as a lone integer
     # routes to `<prefix>_new`.
@@ -433,7 +433,7 @@ end
 end
 
 @testset "hprod and cons_nln" begin
-    lib = CNLPModels.load(LIBPATH)
+    lib = CNLPLib.load(LIBPATH)
     m = CNLPModel(lib, 4; prefix = "tq")
     x = [0.5, 0.25, 2.0, -1.0]
     v = [1.0, -2.0, 3.0, 0.5]
@@ -455,7 +455,7 @@ end
 end
 
 @testset "layout robustness and block sizes" begin
-    lib = CNLPModels.load(LIBPATH)
+    lib = CNLPLib.load(LIBPATH)
     m = CNLPModel(lib, 4; prefix = "tq")
     # Coverage audits sum lengths and read shapes off the refs directly.
     b = get_vars(m, :x)
@@ -470,7 +470,7 @@ end
 end
 
 @testset "standard solution format (cnlp-solution 0.2)" begin
-    m = CNLPModel(CNLPModels.load(LIBPATH), :tq, 4)
+    m = CNLPModel(CNLPLib.load(LIBPATH), :tq, 4)
     res = madnlp(m; print_level = MadNLP.ERROR)
     path = joinpath(mktempdir(), "sol.h5")
     @test write_solution(m, path, res) == path            # no default writer: the standard format

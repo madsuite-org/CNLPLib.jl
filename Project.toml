@@ -1,4 +1,4 @@
-name = "CNLPModels"
+name = "CNLPLib"
 uuid = "e8ddee8d-ce21-405b-9ec9-45cea2c1b284"
 authors = ["Sungho Shin <sushin@mit.edu>"]
 version = "0.4.0"
@@ -18,10 +18,14 @@ HDF5 = "f67ccb44-e63f-5c2f-98bd-6dc0ccc4ba2f"
 CUDACore = "bd0ed864-bdfe-4181-a5ed-ce625a5fdea2"
 
 [extensions]
-CNLPModelsHDF5Ext = "HDF5"
-CNLPModelsCUDAExt = "CUDACore"
+CNLPLibHDF5Ext = "HDF5"
+CNLPLibCUDAExt = "CUDACore"
 
 [compat]
+Libdl = "1"
+LinearAlgebra = "1"
+Mmap = "1"
+Random = "1"
 HDF5 = "0.17"
 CUDACore = "6"
 NLPModels = "0.21"

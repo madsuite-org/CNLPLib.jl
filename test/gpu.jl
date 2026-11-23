@@ -1,12 +1,12 @@
 # GPU check, run by hand on a machine with CUDA (CI has none):
 #
-#   julia --project=<env with CNLPModels, CUDA, NLPModels, HDF5> test/gpu.jl LIB MODEL ARG...
+#   julia --project=<env with CNLPLib, CUDA, NLPModels, HDF5> test/gpu.jl LIB MODEL ARG...
 #
 # LIB is a library compiled with the device tier (`compile_library(...; device = :cuda)`).
 # Every evaluation of `CNLPModel{CuVector}` must match `CNLPModel{Vector}` on the same instance.
-using Test, CNLPModels, CUDA, NLPModels, HDF5
+using Test, CNLPLib, CUDA, NLPModels, HDF5
 
-lib = CNLPModels.load(ARGS[1])
+lib = CNLPLib.load(ARGS[1])
 model = Symbol(ARGS[2])
 args = parse.(Int, ARGS[3:end])
 h = CNLPModel(lib, model, args...)

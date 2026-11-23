@@ -1,21 +1,21 @@
-# CNLPModels.jl
+# CNLPLib.jl
 
-[![CI](https://github.com/madsuite-org/CNLPModels.jl/actions/workflows/ci.yml/badge.svg)](https://github.com/madsuite-org/CNLPModels.jl/actions/workflows/ci.yml)
-[![codecov](https://codecov.io/gh/madsuite-org/CNLPModels.jl/branch/master/graph/badge.svg)](https://codecov.io/gh/madsuite-org/CNLPModels.jl)
+[![CI](https://github.com/madsuite-org/CNLPLib.jl/actions/workflows/ci.yml/badge.svg)](https://github.com/madsuite-org/CNLPLib.jl/actions/workflows/ci.yml)
+[![codecov](https://codecov.io/gh/madsuite-org/CNLPLib.jl/branch/master/graph/badge.svg)](https://codecov.io/gh/madsuite-org/CNLPLib.jl)
 
 Load a nonlinear program (NLP) exposed by a **shared library through a plain
-C interface** and use it as an `NLPModels.AbstractNLPModel` — so any
+C interface** (the [cnlp ABI](https://cnlplib.madsuite.org)) and use it as an `NLPModels.AbstractNLPModel` — so any
 NLPModels-compatible solver (Ipopt via NLPModelsIpopt, or any other) can
 solve it in Julia.
 
-Any library implementing the [cnlp ABI](https://github.com/madsuite-org/cnlp-abi) works, in any source language:
+Any library implementing the [cnlp ABI](https://cnlplib.madsuite.org) works, in any source language:
 `test/fixtures/tinyqp.c` in this repository is a complete reference
 implementation in ~100 lines of plain C.
 
 ```julia
-using CNLPModels, NLPModelsIpopt
+using CNLPLib, NLPModelsIpopt
 
-CNLPModels.set_path!("/opt/models")        # or the CNLPMODELS_PATH env variable
+CNLPLib.set_path!("/opt/models")        # or the CNLPLIB_PATH env variable
 
 m = CNLPModel("@mymodel", 1000)            # resolves libmymodel.so, instance of size 1000
 # m = CNLPModel("/path/to/mymodel", 1000)  # or a literal path: library file or bundle dir
@@ -30,7 +30,7 @@ handle, directly usable as the library argument:
 m = CNLPModel(cnlp"mymodel", 1000)
 ```
 
-(Or bypass the path entirely with `CNLPModels.load("/path/libmymodel.so")`.)
+(Or bypass the path entirely with `CNLPLib.load("/path/libmymodel.so")`.)
 Any number of model instances may coexist per library.
 
 ### Several models in one library
@@ -79,7 +79,7 @@ madnlp(m)
 ### Solutions and model formats
 
 `write_solution(m, path, result)` writes a solver result as a
-[cnlp-solution](https://github.com/madsuite-org/cnlp-abi/blob/master/formats/solution.md)
+[cnlp-solution](https://github.com/madsuite-org/cnlplib/blob/main/formats/solution.md)
 HDF5 file (load HDF5.jl), or with the model's default writer if it names one. Multipliers
 are converted to the cnlp sign convention for maximizing models. A library's own formats
 are reachable by name: `writers(m)`, `write_solution(m, :matpower, path, result)`,
@@ -89,7 +89,7 @@ are reachable by name: `writers(m)`, `write_solution(m, :matpower, path, result)
 ## The C ABI
 
 This package implements **cnlp ABI 0.2**:
-[`cnlp.h`](https://github.com/madsuite-org/cnlp-abi/blob/master/cnlp.h) is the
+[`cnlp.h`](https://github.com/madsuite-org/cnlplib/blob/main/cnlp.h) is the
 specification. A copy is vendored at `test/fixtures/cnlp.h`, where the fixture expands its
 declarations so signature drift fails compilation.
 

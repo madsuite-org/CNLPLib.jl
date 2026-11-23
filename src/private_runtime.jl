@@ -120,18 +120,18 @@ function _dlopen_private(path::AbstractString, ver::AbstractString, flags)
         "self-contained).")
     (Sys.islinux() || Sys.isapple()) || error(
         "$path is an unbundled juliac library, which this Julia process can " *
-        "only load on Linux or macOS (where CNLPModels can give it a private " *
+        "only load on Linux or macOS (where CNLPLib can give it a private " *
         "copy of the installed runtime; loaded as-is it would abort the " *
         "process). Compile with bundle = true for this platform, or consume " *
         "the library from Python/C, where it works as-is.")
 
     libdir = dirname(Libdl.dlpath("libjulia"))     # <prefix>/lib
-    # The scratch runtime is removed at process exit. CNLPMODELS_KEEP_RUNTIME=1
+    # The scratch runtime is removed at process exit. CNLPLIB_KEEP_RUNTIME=1
     # keeps it, so the patched binaries can be inspected after the fact —
     # a successful load otherwise cleans up the very artifacts that show HOW
     # it succeeded (a failed one leaks them, which is the misleading half:
     # the only dir left to inspect is then the broken round's).
-    keep = get(ENV, "CNLPMODELS_KEEP_RUNTIME", "") == "1"
+    keep = get(ENV, "CNLPLIB_KEEP_RUNTIME", "") == "1"
     scratch = mktempdir(prefix = "cnlpmodels_rt_", cleanup = !keep)
     lib = joinpath(scratch, "lib");     mkpath(lib)
     priv = joinpath(lib, "julia");      mkpath(priv)

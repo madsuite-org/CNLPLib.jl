@@ -6,24 +6,24 @@ same instance, with its metadata and buffers on the device, evaluated through th
 callbacks on device pointers. This extension only supplies what differs from the host:
 the pointer conversion, the stream handoff, and the product kernels.
 """
-module CNLPModelsCUDAExt
+module CNLPLibCUDAExt
 
-using CNLPModels, NLPModels, CUDACore
+using CNLPLib, NLPModels, CUDACore
 using CUDACore: CuVector, StridedCuVector
-using CNLPModels: CNLPModel
+using CNLPLib: CNLPModel
 import Libdl
 
 const CuModel = CNLPModel{<:CuVector{Float64}}
 
 # A contiguous CuArray (or contiguous view of one) as the raw device pointer the ABI takes.
-CNLPModels._ptr(a::StridedCuVector{Float64}) = reinterpret(Ptr{Cdouble}, UInt(pointer(a)))
+CNLPLib._ptr(a::StridedCuVector{Float64}) = reinterpret(Ptr{Cdouble}, UInt(pointer(a)))
 
 # The library launches on the legacy default stream and synchronizes its context before
 # returning; CUDA.jl works on task-local streams. Finishing this task's stream first is
 # what orders the library's reads after our writes.
-CNLPModels._sync(::CuModel) = CUDACore.synchronize()
+CNLPLib._sync(::CuModel) = CUDACore.synchronize()
 
-function CNLPModels._device_model(::Val{:cuda}, m::CNLPModel{Vector{Float64}})
+function CNLPLib._device_model(::Val{:cuda}, m::CNLPModel{Vector{Float64}})
     sym(s) = Symbol(m.prefix, "_", s)
     dp = Libdl.dlsym(m.lib.handle, sym(:device); throw_error = false)
     dp === nothing && throw(ArgumentError(
@@ -79,10 +79,10 @@ function _launch!(f, y, rows, cols, vals, x)
     return y
 end
 
-CNLPModels._coo_mul!(y::StridedCuVector{Float64}, rows::CuVector{Int}, cols::CuVector{Int},
+CNLPLib._coo_mul!(y::StridedCuVector{Float64}, rows::CuVector{Int}, cols::CuVector{Int},
                      vals::CuVector{Float64}, v::StridedCuVector{Float64}) =
     _launch!(_coo_kernel!, y, rows, cols, vals, v)
-CNLPModels._sym_mul!(y::StridedCuVector{Float64}, rows::CuVector{Int}, cols::CuVector{Int},
+CNLPLib._sym_mul!(y::StridedCuVector{Float64}, rows::CuVector{Int}, cols::CuVector{Int},
                      vals::CuVector{Float64}, v::StridedCuVector{Float64}) =
     _launch!(_sym_kernel!, y, rows, cols, vals, v)
 

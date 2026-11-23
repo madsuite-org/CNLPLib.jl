@@ -1,5 +1,5 @@
 """
-    CNLPModels
+    CNLPLib
 
 Consume an NLP exposed by a shared library through a plain C interface as an
 `NLPModels.AbstractNLPModel`, so any NLPModels-compatible solver (MadNLP,
@@ -8,7 +8,7 @@ tape recorder (`compile_library`), but any
 library implementing the ABI below works, in any language.
 
 Implements cnlp ABI 0.2 (normative spec: `cnlp.h` at
-https://github.com/madsuite-org/cnlp-abi).
+https://cnlplib.madsuite.org).
 
 A model is a `CNLPModel{VT}`: `VT = Vector{Float64}` evaluates through the library's
 host callbacks; with `device = :cuda` (CUDA extension) `VT` is a `CuVector` and the
@@ -31,8 +31,8 @@ any time.
 # Usage
 
 ```julia
-using CNLPModels, MadNLP
-lib = CNLPModels.load("librecorder.so")
+using CNLPLib, MadNLP
+lib = CNLPLib.load("librecorder.so")
 m = CNLPModel(lib, 1000; prefix = "rec")   # rec_new(1000) → id, fixes BLAS
 res = madnlp(m)
 ```
@@ -40,7 +40,7 @@ res = madnlp(m)
 Instantiation arguments are positional, one per schema field — the same
 spelling `ExaModel(core, arg1, arg2, ...)` uses on the producer side.
 """
-module CNLPModels
+module CNLPLib
 
 using Libdl
 using LinearAlgebra
@@ -76,9 +76,9 @@ const _LIBS = Dict{String, CLib}()
 """
     set_path!(dirs...)
 
-Set the library search path used by name-based loading (`CNLPModels.lib("acopf")`,
+Set the library search path used by name-based loading (`CNLPLib.lib("acopf")`,
 `CNLPModel("@acopf", ...)`, `cnlp"acopf"`). Initialized from the colon-separated
-`CNLPMODELS_PATH` environment variable; calling `set_path!` replaces it.
+`CNLPLIB_PATH` environment variable; calling `set_path!` replaces it.
 """
 function set_path!(dirs::AbstractString...)
     empty!(_PATHS)
@@ -88,7 +88,8 @@ end
 
 function _paths()
     if isempty(_PATHS)
-        env = get(ENV, "CNLPMODELS_PATH", "")
+        # CNLPMODELS_PATH: the name before the package was renamed
+        env = get(ENV, "CNLPLIB_PATH", get(ENV, "CNLPMODELS_PATH", ""))
         isempty(env) || append!(_PATHS, split(env, ":"))
     end
     return _PATHS
@@ -98,7 +99,7 @@ end
     lib(name::AbstractString) -> CLib
 
 Resolve `lib<name>.<dlext>` against the search path ([`set_path!`](@ref) /
-`CNLPMODELS_PATH`) — also accepting `<dir>/lib/lib<name>.<dlext>`, the layout
+`CNLPLIB_PATH`) — also accepting `<dir>/lib/lib<name>.<dlext>`, the layout
 `compile_library` produces — load it, and cache the handle by name.
 """
 function lib(name::AbstractString)
@@ -107,8 +108,8 @@ function lib(name::AbstractString)
         for d in _paths(), cand in (joinpath(d, fname), joinpath(d, name, "lib", fname), joinpath(d, "lib", fname))
             isfile(cand) && return load(cand)
         end
-        error("library $fname not found on the CNLPModels path " *
-              "($(isempty(_paths()) ? "empty — call set_path! or set CNLPMODELS_PATH" : join(_paths(), ':')))")
+        error("library $fname not found on the CNLPLib path " *
+              "($(isempty(_paths()) ? "empty — call set_path! or set CNLPLIB_PATH" : join(_paths(), ':')))")
     end
 end
 
@@ -116,7 +117,7 @@ end
     cnlp"name"
 
 The shortcut onto the library path: resolve `lib<name>.<dlext>` against
-[`set_path!`](@ref) / `CNLPMODELS_PATH`, check that it exists and loads as a
+[`set_path!`](@ref) / `CNLPLIB_PATH`, check that it exists and loads as a
 shared library, and return the (cached) handle — usable directly as the
 library argument of [`CNLPModel`](@ref):
 
@@ -588,7 +589,7 @@ end
 String-based construction:
 
   - `"@opf"` resolves the **name** `opf` via [`lib`](@ref) against
-    [`set_path!`](@ref) / `CNLPMODELS_PATH` (`\$dir/libopf.so`, or the
+    [`set_path!`](@ref) / `CNLPLIB_PATH` (`\$dir/libopf.so`, or the
     bundled layouts `\$dir/opf/lib/libopf.so` and `\$dir/lib/libopf.so`);
     the prefix defaults to the name;
   - any other string is a filesystem **path**, relative to the current
@@ -790,7 +791,7 @@ empty tuples, and everything else about it still works.
 
 Modelling packages export accessors with these names too (ExaModels itself
 does); with both loaded, Julia makes the bare name ambiguous — qualify as
-`CNLPModels.get_vars`.
+`CNLPLib.get_vars`.
 """
 get_vars(m::CNLPModel) = getfield(m, :vars)
 
@@ -1320,4 +1321,4 @@ module PrecompileStatements
     end
 end
 
-end # module CNLPModels
+end # module CNLPLib
