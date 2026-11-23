@@ -8,7 +8,7 @@ tape recorder (`compile_library`), but any
 library implementing the ABI below works, in any language.
 
 Implements cnlp ABI 0.2 (normative spec: `cnlp.h` at
-https://github.com/madsuite-org/cnlp-abi).
+https://cnlplib.madsuite.org).
 
 A model is a `CNLPModel{VT}`: `VT = Vector{Float64}` evaluates through the library's
 host callbacks; with `device = :cuda` (CUDA extension) `VT` is a `CuVector` and the

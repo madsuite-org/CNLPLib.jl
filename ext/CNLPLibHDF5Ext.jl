@@ -1,5 +1,5 @@
 """
-The standard solution format, cnlp-solution 0.2 (formats/solution.md of cnlp-abi): root
+The standard solution format, cnlp-solution 0.2 (formats/solution.md of cnlplib): root
 attributes, the `/solution` group ExaModelsIO also uses, and `/blocks/<kind>/<name>`.
 """
 module CNLPLibHDF5Ext
