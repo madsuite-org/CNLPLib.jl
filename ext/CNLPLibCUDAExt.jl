@@ -50,6 +50,28 @@ function CNLPLib._device_model(::Val{:cuda}, m::CNLPModel{Vector{Float64}})
     )
 end
 
+# ── the solver side: a problem's device callbacks as a ProblemModel{CuVector} ────────
+
+const CuProblem = CNLPLib.ProblemModel{<:CuVector{Float64}}
+CNLPLib._psync(::CuProblem) = CUDACore.synchronize()
+
+function CNLPLib._device_problem_model(::Val{:cuda}, m::CNLPLib.ProblemModel{Vector{Float64}},
+                                       d::CNLPLib.CNLPDeviceProblem)
+    hm = m.meta
+    meta = NLPModelMeta(
+        hm.nvar; ncon = hm.ncon, nnzj = hm.nnzj, nnzh = hm.nnzh,
+        x0 = CuVector(hm.x0), lvar = CuVector(hm.lvar), uvar = CuVector(hm.uvar),
+        y0 = CuVector(hm.y0), lcon = CuVector(hm.lcon), ucon = CuVector(hm.ucon),
+        minimize = hm.minimize,
+    )
+    return CNLPLib.ProblemModel(
+        meta, Counters(), m.p, d.obj_d, d.grad_d, d.cons_d, d.jac_d, d.hess_d,
+        m.jrows, m.jcols, m.hrows, m.hcols,
+        CuVector(m.jrows), CuVector(m.jcols), CuVector(m.hrows), CuVector(m.hcols),
+        CUDACore.zeros(Float64, hm.nnzj), CUDACore.zeros(Float64, hm.nnzh), CUDACore.zeros(Float64, hm.ncon),
+    )
+end
+
 # ── the products' COO matvecs, on the device ──────────────────────────────────────────
 
 function _coo_kernel!(y, rows, cols, vals, x, n)

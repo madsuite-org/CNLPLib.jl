@@ -105,7 +105,13 @@ Base.@ccallable function cnlp_solve(p::Ptr{CNLPLib.CNLPProblem}, n::Int64, keys:
 end
 ```
 
-The other way, `CNLPLib.problem(m)` hands a `CNLPModel` to a cnlp solver library.
+A solver that runs on a GPU also exports `cnlp_solve_device`, which receives the problem's
+device callbacks as well (`Ptr{CNLPLib.CNLPDeviceProblem}`); `CNLPLib.ProblemModel(p, d)` is
+then a `ProblemModel{CuVector}` (CUDA extension), and `set_result!` takes its device arrays.
+
+The other way, `CNLPLib.problem(m)` hands a `CNLPModel` to a cnlp solver library, and
+`CNLPLib.device_problem(problem(m), md)` adds the device problem of `md`, the same instance
+on the GPU.
 
 ## The C ABI
 

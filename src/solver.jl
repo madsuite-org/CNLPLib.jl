@@ -61,8 +61,27 @@ const CNLP_ITERATION_LIMIT = 4
 const CNLP_TIME_LIMIT = 5
 const CNLP_ERROR = 6
 
-"The version of the solver interface implemented here (`CNLP_SOLVER_VERSION`: 0.1)."
-const CNLP_SOLVER_VERSION = 1
+"The version of the solver interface implemented here (`CNLP_SOLVER_VERSION`: 0.2)."
+const CNLP_SOLVER_VERSION = 2
+
+"Memory space of a device problem (`cnlp_solver.h`): CUDA."
+const CNLP_DEVICE_CUDA = 1
+
+"""
+    CNLPDeviceProblem
+
+The layout of `cnlp_device_problem` (`cnlp_solver.h`, 0.2): the device memory space and the
+evaluation callbacks on device pointers (`obj_d` writes one host double), called with the
+host problem's `ctx`.
+"""
+struct CNLPDeviceProblem
+    device::Int64
+    obj_d::Ptr{Cvoid}
+    grad_d::Ptr{Cvoid}
+    cons_d::Ptr{Cvoid}
+    jac_d::Ptr{Cvoid}
+    hess_d::Ptr{Cvoid}
+end
 
 """
     CallbackError(name, status)
@@ -77,25 +96,49 @@ Base.showerror(io::IO, e::CallbackError) = print(io, "the problem's ", e.name, "
 _check_cb(st::Int64, name::Symbol) = st == 0 || throw(CallbackError(name, st))
 
 """
-    ProblemModel(problem::CNLPProblem)
-    ProblemModel(problem::Ptr{CNLPProblem})
+    ProblemModel(problem)                    # on the host
+    ProblemModel(problem, device_problem)    # on the device (the CUDA extension)
 
-An `AbstractNLPModel{Float64, Vector{Float64}}` over a problem given as callbacks, as a
-cnlp solver receives it. The bounds, starting point and starting multipliers are copied;
-evaluations call the problem's callbacks, and a failing callback throws
-[`CallbackError`](@ref). `jprod`/`jtprod` are computed from the Jacobian's coordinates.
+An `AbstractNLPModel{Float64, VT}` over a problem given as callbacks, as a cnlp solver
+receives it: `ProblemModel{Vector{Float64}}` evaluates through the host callbacks; with a
+`cnlp_device_problem` (`using CUDA` or `CUDACore`), `VT` is a `CuVector` and evaluation goes
+through the device callbacks on device pointers. Both take `Ptr`s or the structs. The
+bounds, starting point and starting multipliers are copied (to the device for a device
+model), the sparsity structures are read once on the host, and a failing callback throws
+[`CallbackError`](@ref). `jprod`, `jtprod` and `hprod` are computed from the coordinates.
 """
-struct ProblemModel <: AbstractNLPModel{Float64, Vector{Float64}}
-    meta::NLPModelMeta{Float64, Vector{Float64}}
+struct ProblemModel{VT <: AbstractVector{Float64}, IT <: AbstractVector{Int}} <: AbstractNLPModel{Float64, VT}
+    meta::NLPModelMeta{Float64, VT}
     counters::Counters
     p::CNLPProblem
-    # the Jacobian in coordinates, for the products (filled on first use)
-    jrows::Vector{Int64}
-    jcols::Vector{Int64}
-    jvals::Vector{Float64}
+    # the evaluation callbacks in use: the host ones, or the device problem's
+    obj::Ptr{Cvoid}
+    grad::Ptr{Cvoid}
+    cons::Ptr{Cvoid}
+    jac::Ptr{Cvoid}
+    hess::Ptr{Cvoid}
+    # the structures on the host, the same where VT lives, and buffers for the products
+    jrows::Vector{Int}
+    jcols::Vector{Int}
+    hrows::Vector{Int}
+    hcols::Vector{Int}
+    vjrows::IT
+    vjcols::IT
+    vhrows::IT
+    vhcols::IT
+    jbuf::VT
+    hbuf::VT
+    zeroy::VT
 end
 
 ProblemModel(p::Ptr{CNLPProblem}) = ProblemModel(unsafe_load(p))
+ProblemModel(p::Ptr{CNLPProblem}, d::Ptr{CNLPDeviceProblem}) = ProblemModel(unsafe_load(p), unsafe_load(d))
+
+function _read_structure(p::CNLPProblem, f::Ptr{Cvoid}, nnz::Int, name::Symbol)
+    r = Vector{Int}(undef, nnz); c = Vector{Int}(undef, nnz)
+    nnz == 0 || _check_cb(ccall(f, Int64, (Ptr{Cvoid}, Ptr{Int64}, Ptr{Int64}), p.ctx, r, c), name)
+    return r, c
+end
 
 function ProblemModel(p::CNLPProblem)
     n, m = Int(p.nvar), Int(p.ncon)
@@ -105,13 +148,33 @@ function ProblemModel(p::CNLPProblem)
         x0 = vec(p.x0, n), lvar = vec(p.lvar, n), uvar = vec(p.uvar, n),
         y0 = vec(p.y0, m), lcon = vec(p.lcon, m), ucon = vec(p.ucon, m), minimize = p.minimize != 0,
     )
-    return ProblemModel(meta, Counters(), p, Int64[], Int64[], Float64[])
+    jr, jc = _read_structure(p, p.jac_structure, meta.nnzj, :jac_structure)
+    hr, hc = _read_structure(p, p.hess_structure, meta.nnzh, :hess_structure)
+    return ProblemModel(meta, Counters(), p, p.obj, p.grad, p.cons, p.jac, p.hess,
+                        jr, jc, hr, hc, jr, jc, hr, hc, zeros(meta.nnzj), zeros(meta.nnzh), zeros(m))
 end
+
+function ProblemModel(p::CNLPProblem, d::CNLPDeviceProblem)
+    d.device == CNLP_DEVICE_CUDA || throw(ArgumentError("device problem in memory space $(d.device), not CUDA ($CNLP_DEVICE_CUDA)"))
+    host = ProblemModel(p)
+    hasmethod(_device_problem_model, Tuple{Val{:cuda}, typeof(host), CNLPDeviceProblem}) ||
+        throw(ArgumentError("a CUDA device problem needs CNLPLib's CUDA extension (`using CUDA` or `using CUDACore`)"))
+    return _device_problem_model(Val(:cuda), host, d)
+end
+
+"""
+    _device_problem_model(::Val{device}, host::ProblemModel, d::CNLPDeviceProblem)
+
+The device version of `host`, supplied by a device extension.
+"""
+function _device_problem_model end
+
+_psync(::ProblemModel) = nothing   # the device extension synchronizes before a device call
 
 """
     start_multipliers(m::ProblemModel) -> (zl, zu) or nothing
 
-The problem's starting bound multipliers (`zl0`, `zu0`), when it gives them.
+The problem's starting bound multipliers (`zl0`, `zu0`), on the host, when it gives them.
 """
 function start_multipliers(m::ProblemModel)
     (m.p.zl0 == C_NULL || m.p.zu0 == C_NULL) && return nothing
@@ -121,39 +184,41 @@ end
 
 function NLPModels.obj(m::ProblemModel, x::AbstractVector{Float64})
     increment!(m, :neval_obj)
+    _psync(m)
     f = Ref(0.0)
-    _check_cb(ccall(m.p.obj, Int64, (Ptr{Cvoid}, Ptr{Float64}, Ptr{Float64}), m.p.ctx, x, f), :obj)
+    _check_cb(ccall(m.obj, Int64, (Ptr{Cvoid}, Ptr{Float64}, Ptr{Float64}), m.p.ctx, _ptr(x), f), :obj)
     return f[]
 end
 
 function NLPModels.grad!(m::ProblemModel, x::AbstractVector{Float64}, g::AbstractVector{Float64})
     increment!(m, :neval_grad)
-    _check_cb(ccall(m.p.grad, Int64, (Ptr{Cvoid}, Ptr{Float64}, Ptr{Float64}), m.p.ctx, x, g), :grad)
+    _psync(m)
+    _check_cb(ccall(m.grad, Int64, (Ptr{Cvoid}, Ptr{Float64}, Ptr{Float64}), m.p.ctx, _ptr(x), _ptr(g)), :grad)
     return g
 end
 
 function NLPModels.cons_nln!(m::ProblemModel, x::AbstractVector{Float64}, c::AbstractVector{Float64})
     increment!(m, :neval_cons_nln)
     m.meta.ncon == 0 && return c
-    _check_cb(ccall(m.p.cons, Int64, (Ptr{Cvoid}, Ptr{Float64}, Ptr{Float64}), m.p.ctx, x, c), :cons)
+    _psync(m)
+    _check_cb(ccall(m.cons, Int64, (Ptr{Cvoid}, Ptr{Float64}, Ptr{Float64}), m.p.ctx, _ptr(x), _ptr(c)), :cons)
     return c
 end
 
-function _structure(m::ProblemModel, f::Ptr{Cvoid}, nnz::Int, rows, cols, name::Symbol)
-    r = Vector{Int64}(undef, nnz); c = Vector{Int64}(undef, nnz)
-    nnz == 0 || _check_cb(ccall(f, Int64, (Ptr{Cvoid}, Ptr{Int64}, Ptr{Int64}), m.p.ctx, r, c), name)
-    copyto!(rows, r); copyto!(cols, c)
+function NLPModels.jac_nln_structure!(m::ProblemModel, rows::AbstractVector{<:Integer}, cols::AbstractVector{<:Integer})
+    copyto!(rows, m.jrows); copyto!(cols, m.jcols)
     return rows, cols
 end
-NLPModels.jac_nln_structure!(m::ProblemModel, rows::AbstractVector{<:Integer}, cols::AbstractVector{<:Integer}) =
-    _structure(m, m.p.jac_structure, m.meta.nnzj, rows, cols, :jac_structure)
-NLPModels.hess_structure!(m::ProblemModel, rows::AbstractVector{<:Integer}, cols::AbstractVector{<:Integer}) =
-    _structure(m, m.p.hess_structure, m.meta.nnzh, rows, cols, :hess_structure)
+function NLPModels.hess_structure!(m::ProblemModel, rows::AbstractVector{<:Integer}, cols::AbstractVector{<:Integer})
+    copyto!(rows, m.hrows); copyto!(cols, m.hcols)
+    return rows, cols
+end
 
 function NLPModels.jac_nln_coord!(m::ProblemModel, x::AbstractVector{Float64}, vals::AbstractVector{Float64})
     increment!(m, :neval_jac_nln)
     m.meta.nnzj == 0 && return vals
-    _check_cb(ccall(m.p.jac, Int64, (Ptr{Cvoid}, Ptr{Float64}, Ptr{Float64}), m.p.ctx, x, vals), :jac)
+    _psync(m)
+    _check_cb(ccall(m.jac, Int64, (Ptr{Cvoid}, Ptr{Float64}, Ptr{Float64}), m.p.ctx, _ptr(x), _ptr(vals)), :jac)
     return vals
 end
 
@@ -161,44 +226,36 @@ function NLPModels.hess_coord!(m::ProblemModel, x::AbstractVector{Float64}, y::A
                                vals::AbstractVector{Float64}; obj_weight::Real = 1.0)
     increment!(m, :neval_hess)
     m.meta.nnzh == 0 && return vals
-    _check_cb(ccall(m.p.hess, Int64, (Ptr{Cvoid}, Ptr{Float64}, Ptr{Float64}, Float64, Ptr{Float64}),
-                 m.p.ctx, x, y, Float64(obj_weight), vals), :hess)
+    _psync(m)
+    _check_cb(ccall(m.hess, Int64, (Ptr{Cvoid}, Ptr{Float64}, Ptr{Float64}, Float64, Ptr{Float64}),
+                    m.p.ctx, _ptr(x), _ptr(y), Float64(obj_weight), _ptr(vals)), :hess)
     return vals
 end
 NLPModels.hess_coord!(m::ProblemModel, x::AbstractVector{Float64}, vals::AbstractVector{Float64};
-                      obj_weight::Real = 1.0) = NLPModels.hess_coord!(m, x, zeros(m.meta.ncon), vals; obj_weight)
+                      obj_weight::Real = 1.0) = NLPModels.hess_coord!(m, x, m.zeroy, vals; obj_weight)
 
-# J v and J' v from the Jacobian's coordinates (the interface has no products)
-function _jacobian!(m::ProblemModel, x::AbstractVector{Float64})
-    if length(m.jrows) != m.meta.nnzj
-        resize!(m.jrows, m.meta.nnzj); resize!(m.jcols, m.meta.nnzj); resize!(m.jvals, m.meta.nnzj)
-        NLPModels.jac_nln_structure!(m, m.jrows, m.jcols)
-    end
-    NLPModels.jac_nln_coord!(m, x, m.jvals)
-    return m
-end
-
+# products from the coordinates (the interface has none)
 function NLPModels.jprod_nln!(m::ProblemModel, x::AbstractVector{Float64}, v::AbstractVector{Float64},
                               Jv::AbstractVector{Float64})
     increment!(m, :neval_jprod_nln)
-    _jacobian!(m, x)
-    fill!(Jv, 0.0)
-    @inbounds for k in eachindex(m.jvals)
-        Jv[m.jrows[k]] += m.jvals[k] * v[m.jcols[k]]
-    end
-    return Jv
+    NLPModels.jac_nln_coord!(m, x, m.jbuf)
+    return _coo_mul!(Jv, m.vjrows, m.vjcols, m.jbuf, v)
 end
-
 function NLPModels.jtprod_nln!(m::ProblemModel, x::AbstractVector{Float64}, v::AbstractVector{Float64},
                                Jtv::AbstractVector{Float64})
     increment!(m, :neval_jtprod_nln)
-    _jacobian!(m, x)
-    fill!(Jtv, 0.0)
-    @inbounds for k in eachindex(m.jvals)
-        Jtv[m.jcols[k]] += m.jvals[k] * v[m.jrows[k]]
-    end
-    return Jtv
+    NLPModels.jac_nln_coord!(m, x, m.jbuf)
+    return _coo_mul!(Jtv, m.vjcols, m.vjrows, m.jbuf, v)
 end
+function NLPModels.hprod!(m::ProblemModel, x::AbstractVector{Float64}, y::AbstractVector{Float64},
+                          v::AbstractVector{Float64}, Hv::AbstractVector{Float64}; obj_weight::Real = 1.0)
+    increment!(m, :neval_hprod)
+    NLPModels.hess_coord!(m, x, y, m.hbuf; obj_weight)
+    return _sym_mul!(Hv, m.vhrows, m.vhcols, m.hbuf, v)
+end
+NLPModels.hprod!(m::ProblemModel, x::AbstractVector{Float64}, v::AbstractVector{Float64},
+                 Hv::AbstractVector{Float64}; obj_weight::Real = 1.0) =
+    NLPModels.hprod!(m, x, m.zeroy, v, Hv; obj_weight)
 
 """
     solver_options(noptions, keys, values) -> Vector{Pair{String, String}}
@@ -207,6 +264,9 @@ The options a cnlp solver receives (`key=value` strings), read from the C arrays
 """
 solver_options(n::Integer, keys::Ptr{Ptr{UInt8}}, vals::Ptr{Ptr{UInt8}}) =
     Pair{String, String}[unsafe_string(unsafe_load(keys, k)) => unsafe_string(unsafe_load(vals, k)) for k in 1:n]
+
+_host(v::Vector{Float64}) = v
+_host(v::AbstractVector) = Vector{Float64}(Array(v))
 
 _text128(s::AbstractString) = (b = codeunits(s); ntuple(i -> i < 128 && i <= length(b) ? b[i] : 0x00, 128))
 
@@ -225,6 +285,8 @@ function set_result!(result::Ptr{CNLPResult}, m::ProblemModel, x::AbstractVector
     r = unsafe_load(result)
     n, k = m.meta.nvar, m.meta.ncon
     s = m.meta.minimize ? 1.0 : -1.0
+    # on the host (from a device model's arrays)
+    x, y, zl, zu = _host(x), _host(y), _host(zl), _host(zu)
     for i in 1:n
         unsafe_store!(r.x, x[i], i)
         unsafe_store!(r.zl, s * zl[i], i)
@@ -262,6 +324,9 @@ keep it alive while a solver uses the problem.
 mutable struct ModelProblem
     model::CNLPModel{Vector{Float64}}
     ref::Base.RefValue{CNLPProblem}
+    # the same instance on the device, and its device problem (`device_problem`)
+    device::Any
+    dref::Base.RefValue{CNLPDeviceProblem}
     ModelProblem(m::CNLPModel{Vector{Float64}}) = new(m)
 end
 Base.unsafe_convert(::Type{Ptr{CNLPProblem}}, h::ModelProblem) = Base.unsafe_convert(Ptr{CNLPProblem}, h.ref)
@@ -318,4 +383,42 @@ function problem(m::CNLPModel{Vector{Float64}})
         @cfunction(_cb_hess, Int64, (Ptr{Cvoid}, Ptr{Float64}, Ptr{Float64}, Float64, Ptr{Float64})),
     ))
     return h
+end
+
+# the device callbacks: the device model's evaluations (`P_*_d`) on the device pointers
+_dmodel(c::Ptr{Cvoid}) = (unsafe_pointer_to_objref(c)::ModelProblem).device::CNLPModel
+function _dev_eval(c::Ptr{Cvoid}, which::Symbol, x::Ptr{Float64}, out::Ptr{Float64})
+    md = _dmodel(c)
+    _sync(md)
+    f = getfield(md, which)
+    return ccall(f, Int64, (Int64, Ptr{Float64}, Ptr{Float64}), md.id, x, out)
+end
+_cbd_obj(c::Ptr{Cvoid}, x::Ptr{Float64}, f::Ptr{Float64}) = _dev_eval(c, :obj_p, x, f)
+_cbd_grad(c::Ptr{Cvoid}, x::Ptr{Float64}, g::Ptr{Float64}) = _dev_eval(c, :grad_p, x, g)
+_cbd_cons(c::Ptr{Cvoid}, x::Ptr{Float64}, v::Ptr{Float64}) = _dev_eval(c, :cons_p, x, v)
+_cbd_jac(c::Ptr{Cvoid}, x::Ptr{Float64}, v::Ptr{Float64}) = _dev_eval(c, :jac_p, x, v)
+function _cbd_hess(c::Ptr{Cvoid}, x::Ptr{Float64}, y::Ptr{Float64}, w::Float64, v::Ptr{Float64})
+    md = _dmodel(c)
+    _sync(md)
+    return ccall(md.hess_p, Int64, (Int64, Ptr{Float64}, Ptr{Float64}, Float64, Ptr{Float64}), md.id, x, y, w, v)
+end
+
+"""
+    device_problem(p::ModelProblem, md::CNLPModel) -> Ref{CNLPDeviceProblem}
+
+The device problem for `p = problem(m)`, evaluating `md`, the same instance on the device
+(`CNLPModel(...; device = :cuda)`), to hand a cnlp solver's `cnlp_solve_device` with `p`.
+Keep `p` alive while it is used.
+"""
+function device_problem(h::ModelProblem, md::CNLPModel)
+    h.device = md
+    h.dref = Ref(CNLPDeviceProblem(
+        CNLP_DEVICE_CUDA,
+        @cfunction(_cbd_obj, Int64, (Ptr{Cvoid}, Ptr{Float64}, Ptr{Float64})),
+        @cfunction(_cbd_grad, Int64, (Ptr{Cvoid}, Ptr{Float64}, Ptr{Float64})),
+        @cfunction(_cbd_cons, Int64, (Ptr{Cvoid}, Ptr{Float64}, Ptr{Float64})),
+        @cfunction(_cbd_jac, Int64, (Ptr{Cvoid}, Ptr{Float64}, Ptr{Float64})),
+        @cfunction(_cbd_hess, Int64, (Ptr{Cvoid}, Ptr{Float64}, Ptr{Float64}, Float64, Ptr{Float64})),
+    ))
+    return h.dref
 end
