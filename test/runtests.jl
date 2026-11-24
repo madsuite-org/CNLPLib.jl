@@ -489,3 +489,4 @@ end
         @test haskey(f, "blocks/variables/x")             # tq names its variable x
     end
 end
+include("solver.jl")
