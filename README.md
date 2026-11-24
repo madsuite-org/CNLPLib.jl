@@ -86,6 +86,27 @@ are reachable by name: `writers(m)`, `write_solution(m, :matpower, path, result)
 `readers(lib, :acopf)`, `CNLPModel(lib, :acopf; input = :matpower => "case.m")`,
 `read_start(m, :matpower, path)`, `read_parameters!(m, :name, path)`.
 
+### Solvers: the other side of the interface
+
+cnlplib hands a model to a solver as a `cnlp_problem` (`cnlp_solver.h`): sizes, bounds,
+a starting point and evaluation callbacks. A solver written in Julia and compiled as a cnlp
+solver library receives a `Ptr{CNLPLib.CNLPProblem}`, solves `CNLPLib.ProblemModel(p)` (an
+`AbstractNLPModel`) with any NLPModels solver, and reports with `CNLPLib.set_result!`, which
+writes the multipliers in the cnlp sign convention:
+
+```julia
+Base.@ccallable function cnlp_solve(p::Ptr{CNLPLib.CNLPProblem}, n::Int64, keys::Ptr{Ptr{UInt8}},
+                                    vals::Ptr{Ptr{UInt8}}, r::Ptr{CNLPLib.CNLPResult})::Int64
+    m = CNLPLib.ProblemModel(p)
+    s = madnlp(m)        # options: CNLPLib.solver_options(n, keys, vals)
+    CNLPLib.set_result!(r, m, s.solution, s.multipliers, s.multipliers_L, s.multipliers_U,
+                        s.objective, CNLPLib.CNLP_SOLVED, s.iter, string(s.status))
+    return 0
+end
+```
+
+The other way, `CNLPLib.problem(m)` hands a `CNLPModel` to a cnlp solver library.
+
 ## The C ABI
 
 This package implements **cnlp ABI 0.2**:

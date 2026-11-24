@@ -1321,4 +1321,6 @@ module PrecompileStatements
     end
 end
 
+include("solver.jl")
+
 end # module CNLPLib
